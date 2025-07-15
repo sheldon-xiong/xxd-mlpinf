@@ -1,0 +1,8 @@
+onnx-graphsurgeon==0.5.2
+boto3==1.35.84
+botocore==1.35.84
+opencv-python==4.11.0.86
+numpy==1.26.4
+pandas==2.2.2
+torchvision==0.20.0
+git+https://github.com/mlcommons/logging.git@4.1.0-rc3

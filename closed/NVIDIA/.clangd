@@ -1,0 +1,19 @@
+CompileFlags:
+  Add: [
+    # all the include path used in this project
+    -I/work/code/harness/harness_llm,
+    -I/work/build/TRTLLM/cpp,
+    -I/work/build/TRTLLM/cpp/include,
+    -I/usr/local/cuda/include,
+    -I/work/build/inference/loadgen,
+    -I/work/code/harness/lwis/include,
+    -I/work/code/harness/common,
+    -I/work/code/harness/lwis/../common,
+    -I/opt/hpcx/ompi/include/,
+    -I/usr/include/nccl,
+
+    #TODO(zihaok): different target using different C++ version
+    -std=c++20
+  ]
+Index:
+  Background: Build

@@ -1,0 +1,156 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from dataclasses import dataclass
+from pathlib import Path
+from pprint import pformat
+from typing import Any, Callable, Dict, List, Type
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import numpy as np
+
+from code.common.constants import Scenario
+from code.common.systems.system_list import DETECTED_SYSTEM
+from code.common.workload import Workload
+from code.fields.harness import CoreType
+import mlperf_loadgen as lg
+from nvmitten.nvidia.accelerator import GPU
+
+from .config import GenerationConfig, HarnessConfig
+from .cores import BackendRegistry, LLMCore
+from .server import LLMServer
+from .utils import LLMServerProgressDisplay, prefix_logger as logging
+from .warmup import WarmupManager
+
+
+def complete_loadgen_request(request_id: int, output_tokens: List[int], is_first_token: bool):
+    complete_fn = lg.FirstTokenComplete if is_first_token else lg.QuerySamplesComplete
+    output_tokens = np.ascontiguousarray(output_tokens, dtype=np.uint32)
+    output_seq_len = len(output_tokens)
+    output_toks_ptr = output_tokens.ctypes.data
+    output_toks_size = output_seq_len * output_tokens.itemsize
+    complete_fn([lg.QuerySampleResponse(request_id, output_toks_ptr, output_toks_size, output_seq_len)])
+
+
+class LLMServerFactory:
+    """Factory for creating and configuring all LLM server components"""
+
+    @staticmethod
+    def create_server(
+        backend_type: CoreType,
+        workload: Workload,
+        disable_progress_display: bool = False,
+        verbose: bool = False,
+        verbose_nvtx: bool = False,
+        **backend_kwargs
+    ) -> LLMServer:
+        """Create complete LLMServer with all components"""
+
+        # Get backend class
+        backend_class = BackendRegistry.get(backend_type)
+
+        # Create base config class to initialize other components
+        base_config = HarnessConfig()
+
+        # Create progress display with backend-specific metrics
+        progress_display = LLMServerFactory._create_progress_display(workload,
+                                                                     base_config,
+                                                                     disable_progress_display)
+
+        # Create cores using backend's static methods
+        num_cores = backend_class.get_num_cores_for_workload(**backend_kwargs)
+
+        # Initialize cores sequentially
+        cores = []
+        for core_index in range(num_cores):
+            core_kwargs = backend_class.get_config_for_core(
+                core_index=core_index,
+                complete_callback=complete_loadgen_request,
+                progress_display=progress_display,
+                verbose=verbose,
+                verbose_nvtx=verbose_nvtx,
+                **backend_kwargs
+            )
+            core = backend_class(**core_kwargs)
+            cores.append(core)
+
+            if core_index == 0:
+                logging.info(f"Initialized {core.name} with HarnessConfig:\n{pformat(core.harness_config, compact=True)}")
+            else:
+                logging.info(f"Initialized {core.name}.")
+
+        # Create scheduler based on traffic distribution policy
+        scheduler = LLMServerFactory._create_scheduler(cores,
+                                                       base_config.traffic_distribution_policy)
+
+        logging.info(f"Factory created {len(cores)} {str(backend_type)} cores")
+
+        # Create WarmupManager for parallel warmup
+        warmup_manager = WarmupManager()
+
+        # Create and return configured LLMServer
+        return LLMServer(
+            cores=cores,
+            scheduler=scheduler,
+            progress_display=progress_display,
+            harness_config=base_config,
+            workload=workload,
+            warmup_manager=warmup_manager,
+            verbose=verbose,
+            verbose_nvtx=verbose_nvtx
+        )
+
+    @staticmethod
+    def _create_progress_display(
+        workload: Workload,
+        harness_config: HarnessConfig,
+        disable: bool,
+    ) -> LLMServerProgressDisplay:
+        """Create progress display with appropriate metrics"""
+        # Base metrics
+        additional_units = {'tokens/s': 'mean'}
+
+        # Streaming metrics
+        if harness_config.gen_config.streaming:
+            additional_units |= {'TTFT(s)': '99%', 'TPOT(ms)': '99%'}
+
+        if harness_config.show_steady_state_progress:
+            additional_units |= {'steady_state_tokens/s': 'throughput_tracker'}
+
+        return LLMServerProgressDisplay(
+            total=0,
+            enable_render=not disable,
+            additional_units=additional_units,
+            log_dir=workload.log_dir
+        )
+
+    @staticmethod
+    def _create_scheduler(cores: List[LLMCore], policy: str) -> Callable[[], LLMCore]:
+        """Create scheduler function (same as current LLMServer.reset_scheduler)"""
+        state = {'round_robin_index': -1}
+
+        def round_robin() -> LLMCore:
+            state['round_robin_index'] = (state['round_robin_index'] + 1) % len(cores)
+            return cores[state['round_robin_index']]
+
+        def load_balancing() -> LLMCore:
+            queue_sizes = {i: core.get_num_pending_samples() for i, core in enumerate(cores)}
+            min_index = min(queue_sizes, key=queue_sizes.get)
+            return cores[min_index]
+
+        schedulers = {
+            'round_robin': round_robin,
+            'load_balancing': load_balancing
+        }
+
+        return schedulers[policy]
