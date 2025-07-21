@@ -22,6 +22,15 @@ HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download deepseek-ai/deepseek-r1 --r
 
 ```
 
+Please download the quantized checkpoint from Huggingface:
+
+```bash
+export CHECKPOINT_PATH=build/models/deepseek-r1/fp4-quantized-modelopt/deepseek_r1-torch-fp4
+git lfs install
+git clone https://huggingface.co/nvidia/deepseek-r1-fp4 ${CHECKPOINT_PATH}
+cd ${CHECKPOINT_PATH} && git checkout 4bedb8a695a119b1a38d16a675c4665e58708aea
+```
+
 ### Download and Prepare Data
 
 Please download data files by following the mlcommons README.md with instructions.

@@ -10,22 +10,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-###############################################################################
-# Copyright (C) 2023 Habana Labs, Ltd. an Intel Company
-###############################################################################
 
 import contextlib
-from pathlib import Path
 from typing import List
 
-from nvmitten.configurator import autoconfigure, bind
-from nvmitten.nvidia.cupy import CUDARTWrapper as cudart
+from nvmitten.configurator import autoconfigure
 from nvmitten.nvidia.accelerator import GPU
 import mlperf_loadgen as lg
 
 from code.common import logging
 from code.common.constants import Scenario
-from code.common.utils import get_e2e_batch_size
 from code.common.systems.system_list import DETECTED_SYSTEM
 from code.ops.harness import PyHarnessOp
 from code.ops.loadgen import LoadgenConfFilesOp

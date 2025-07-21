@@ -19,7 +19,6 @@ import contextlib
 import dataclasses as dcls
 import functools
 import heapq
-import logging
 import os
 import platform
 import random
@@ -157,7 +156,9 @@ class nvtx_scope:
                  color: Optional[str] = None,
                  verbose_nvtx: bool = False):
         self.name = name
-        self.color = color if color else random.choice(["green", "blue", "yellow", "pink"])
+        # Use hash-based color selection for consistency across runs
+        available_colors = ["green", "blue", "yellow", "pink"]
+        self.color = color if color else available_colors[hash(name) % len(available_colors)]
         self.enable = verbose_nvtx
 
         self.markers = None
@@ -521,7 +522,7 @@ def prepare_virtual_env(benchmark, force_rebuild: bool = False):
         yield
     else:
         if os.path.exists(benchmark.venv_path) and not force_rebuild:
-            logging.warning(f"{benchmark.value.name} virtual env exists, skipping venv setup")
+            logging.warning(f"{benchmark.value.name} virtual env exists, skipping venv setup at {benchmark.venv_path}")
         else:
             if os.path.exists(benchmark.venv_path):
                 shutil.rmtree(benchmark.venv_path)
@@ -539,7 +540,7 @@ def prepare_virtual_env(benchmark, force_rebuild: bool = False):
                 logging.error(f"Failed to install requirements for {benchmark.value.name}")
                 raise e
 
-        if benchmark.is_llm and os.environ.get('ENV', '') == 'release':
+        if (benchmark.is_llm or "whisper" in {benchmark.venv_path}) and os.environ.get('ENV', '') == 'release':
             try:
                 # release mode will have tensorrt_llm installed in default python environment, dev move will not,
                 #  so we look for it in the build directory assuming user has run make build_trt_llm

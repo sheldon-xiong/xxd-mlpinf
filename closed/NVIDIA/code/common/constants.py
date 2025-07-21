@@ -181,6 +181,7 @@ class Benchmark(AliasedNameEnum):
     ResNet50: AliasedName = AliasedName("resnet50", ("resnet",))
     Retinanet: AliasedName = AliasedName("retinanet", ("ssd-retinanet", "resnext", "ssd-resnext"))
     SDXL: AliasedName = AliasedName("stable-diffusion-xl", ("sdxl-base", "diffusion", "stable-diffusion", "sdxl"))
+    WHISPER: AliasedName = AliasedName("whisper", ("whisper-large-v3"))
     RGAT: AliasedName = AliasedName("rgat", ("r-gat",))
 
     @property
@@ -229,7 +230,8 @@ class Benchmark(AliasedNameEnum):
                         Benchmark.LLAMA3_1_8B,
                         Benchmark.LLAMA3_1_405B,
                         Benchmark.Mixtral8x7B,
-                        Benchmark.DeepSeek_R1)
+                        Benchmark.DeepSeek_R1,
+                        Benchmark.WHISPER)
 
     @property
     def supports_triton(self):
@@ -306,6 +308,7 @@ class Action(AliasedNameEnum):
     RunHarness: AliasedName = AliasedName("run_harness")
     RunAuditHarness: AliasedName = AliasedName("run_audit_harness")
     GenerateTritonConfig: AliasedName = AliasedName("generate_triton_config")
+    GenerateDisaggConfig: AliasedName = AliasedName("generate_disagg_config")
     RunLLMServer: AliasedName = AliasedName("run_llm_server")
 
 

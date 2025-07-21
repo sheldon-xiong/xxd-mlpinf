@@ -18,10 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Any, Dict, Optional
 import logging
-import multiprocessing as mp
 import os
 import re
-import venv
 
 from nvmitten.configurator import bind, autoconfigure
 from nvmitten.utils import run_command
@@ -355,7 +353,7 @@ class Mixtral8x7bAccuracyChecker(AccuracyChecker):
             f"--mlperf-accuracy-file={self.log_file}",
             f"--dataset-file={self.ref_acc_pkl_path}",
         ]
-        return _AccuracyScriptCommand(paths.WORKING_DIR / f"code/mixtral-8x7b/tensorrt/run_accuracy.sh", argv, dict())
+        return _AccuracyScriptCommand(str(paths.WORKING_DIR / "code/mixtral-8x7b/tensorrt/run_accuracy.sh"), argv, dict())
 
     def get_accuracy(self) -> List[Dict[Any, Any]]:
         """Runs the accuracy script and get_accuracys the accuracy results for Mixtral-8x7B.
@@ -553,6 +551,50 @@ class SDXLAccuracyChecker(AccuracyChecker):
         return accuracy_result_list
 
 
+class WhisperAccuracyChecker(AccuracyChecker):
+    """Accuracy checker implementation for Whisper benchmark."""
+
+    def __init__(self, wl: Workload):
+        super().__init__(wl, "speech2text/accuracy_eval.py")
+        self.log_dir = wl.log_dir
+
+        self.acc_metric_list = list(G_ACC_TARGETS[self.full_benchmark_name])[::2]
+        self.acc_pattern_list = [G_ACC_PATTERNS[acc_metric] for acc_metric in self.acc_metric_list]
+        self.threshold_list = list(G_ACC_TARGETS[self.full_benchmark_name])[1::2]
+
+    def get_cmd(self):
+        cmd = "python3"
+        argv = [paths.MLCOMMONS_INF_REPO / self.mlcommons_module_path,
+                f"--log_dir {self.log_dir}",
+                f"--dataset_dir {paths.BUILD_DIR}/preprocessed_data/whisper-large-v3/dev-all-repack/",
+                f"--manifest {paths.BUILD_DIR}/preprocessed_data/whisper-large-v3/dev-all-repack.json",
+                "--output_dtype int8",
+                ]
+
+        env = dict()
+
+        return _AccuracyScriptCommand(cmd, argv, env)
+
+    def get_accuracy(self) -> List[Dict[str, Any]]:
+
+        try:
+            wer_string = self.run()
+        except Exception as e:
+            logging.error(f"Accuracy run FAILED: {e}")
+
+        accuracy_result_list = []
+        for i, acc_pattern in enumerate(self.acc_pattern_list):
+            result_regex = re.compile(acc_pattern)
+            threshold = self.threshold_list[i]
+            for line in wer_string:
+                result_match = result_regex.search(line)
+                if not result_match is None:
+                    accuracy = float(result_match.group(1))
+                    passed = accuracy >= threshold
+                    accuracy_result_list.append({"name": self.acc_metric_list[0], "value": accuracy, "threshold": threshold, "pass": passed})
+        return accuracy_result_list
+
+
 G_ACCURACY_CHECKER_MAP = {C.Benchmark.BERT: BERTAccuracyChecker,
                           C.Benchmark.DLRMv2: DLRMv2AccuracyChecker,
                           C.Benchmark.GPTJ: GPTJAccuracyChecker,
@@ -563,7 +605,8 @@ G_ACCURACY_CHECKER_MAP = {C.Benchmark.BERT: BERTAccuracyChecker,
                           C.Benchmark.DeepSeek_R1: DeepSeek_R1AccuracyChecker,
                           C.Benchmark.Retinanet: RetinanetAccuracyChecker,
                           C.Benchmark.RGAT: RGATAccuracyChecker,
-                          C.Benchmark.SDXL: SDXLAccuracyChecker}
+                          C.Benchmark.SDXL: SDXLAccuracyChecker,
+                          C.Benchmark.WHISPER: WhisperAccuracyChecker}
 """Dict[Benchmark, AccuracyChecker]: Maps a Benchmark to its AccuracyChecker"""
 
 

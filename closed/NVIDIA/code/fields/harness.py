@@ -211,6 +211,7 @@ class CoreType(Enum):
     """Enum for supported core types"""
     TRTLLM_EXECUTOR = "trtllm_executor"
     TRTLLM_ENDPOINT = "trtllm_endpoint"
+    TRTLLM_DISAGG = "trtllm_disagg"
     TRTLLM_HLAPI = "trtllm_hlapi"
     TRITON_GRPC = "triton_grpc"
     DUMMY = "dummy"

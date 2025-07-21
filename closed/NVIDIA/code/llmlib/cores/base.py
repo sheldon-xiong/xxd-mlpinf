@@ -19,13 +19,15 @@ from dataclasses import dataclass
 import datetime
 import threading
 import time
+import gc
 from typing import Any, Callable, Dict, List, Tuple, Type, Optional
 
+import numpy as np
 from code.common.utils import nvtx_scope
 import logging
 
 from ..config import HarnessConfig
-from ..utils import LLMServerProgressDisplay, PrefixLogger, track_latencies
+from ..utils import LLMServerProgressDisplay, LatencyTracker, PrefixLogger
 
 
 @dataclass
@@ -50,6 +52,7 @@ class LLMResponse:
         request_id: Unique identifier matching the original request
         output_tokens: List of generated token sequences (one per beam)
         is_final_token: Whether this is the final response for the request
+        error: Optional exception if an error occurred
     """
     request_id: int
     output_tokens: Optional[List[List[int]]]  # List of responses for each beam
@@ -64,9 +67,8 @@ class LLMCore(ABC):
     Required Protocols (must be implemented by subclasses):
     - _enqueue_impl: Request enqueueing and processing
     - _poll_responses_impl: yield ready responses
-    - user must call _initialize_response_thread() at end of __init__()
 
-    The core launches 1 response thread to receive completed requests and complete via complete_callback.
+    NOTE: subclasses must call _initialize_response_thread() at end of their __init__()
 
     LLMCore is the worker unit LLMServer can issue queries to.
     As such, it can be a in-process executor, external grpc server, or http endpoint, etc.
@@ -78,8 +80,8 @@ class LLMCore(ABC):
     def __init__(
         self,
         name: str,
-        complete_callback: Callable,
         harness_config: HarnessConfig,
+        complete_callback: Callable,
         progress_display: LLMServerProgressDisplay,
         verbose: bool = False,
         verbose_nvtx: bool = False,
@@ -88,34 +90,38 @@ class LLMCore(ABC):
 
         Args:
             name: Name of the core instance (e.g., "TrtllmExecutorCore#0")
-            complete_callback: Callback function invoked when requests complete
             harness_config: Configuration for this core instance
+            complete_callback: Callback function for completed requests
             progress_display: Shared progress display for metrics reporting
             verbose: Whether to enable verbose logging
             verbose_nvtx: Whether to enable verbose NVTX profiling markers
         """
         self.name = name
         self.harness_config = harness_config
+        self.complete_callback = complete_callback
         self.progress_display = progress_display
         self.verbose = verbose
         self.verbose_nvtx = verbose_nvtx
-        self.complete_callback = complete_callback
         self.logger = PrefixLogger(prefix=self.name)
+
         self.processed_count = 0
         self.in_warmup_mode = False
+        self.latency_tracker: Optional[LatencyTracker] = None
 
         if self.verbose:
             self.logger.setLevel(logging.DEBUG)
 
-        # Response thread collects responses and reports back to loadgen
-        self.response_thread = None
-        self.response_thread_exit = threading.Event()
+        # Stop work signal
         self.stop_work = threading.Event()
         self.flush_signal = threading.Condition()
 
         # Track pending samples for proper cleanup and synchronization
         self.pending_samples_lock = threading.Lock()
         self.pending_samples: Dict[int, Tuple[int, int]] = {}  # executor_id -> (request_id, enqueue_time)
+
+        # Response thread will be initialized by subclasses via _initialize_response_thread()
+        self.response_thread = None
+        self.response_thread_exit = threading.Event()
 
     @contextlib.contextmanager
     def warmup_mode(self):
@@ -141,19 +147,6 @@ class LLMCore(ABC):
         # not making this thread safe since its used for load balancing and approx queue size is sufficient
         return len(self.pending_samples)
 
-    def _initialize_response_thread(self):
-        """
-        Initialize the response thread that polls for completed requests.
-
-        This should be called after the backend is fully initialized and ready
-        to process responses.
-
-        The response thread runs until notify_stop() is called.
-        """
-        self.response_thread = threading.Thread(target=self._poll_responses, args=())
-        self.response_thread.daemon = True
-        self.response_thread.start()
-
     def enqueue(self, queries: List[LLMRequest]) -> int:
         """
         Enqueue input samples for processing.
@@ -173,177 +166,10 @@ class LLMCore(ABC):
                 executor_request_id: (request_id, enqueue_time)
                 for request_id, executor_request_id in zip(request_ids, executor_request_ids)
             }
+            if self.latency_tracker is not None and self.harness_config.gen_config.streaming and not self.in_warmup_mode:
+                self.latency_tracker.add_sample(queries[0].request_id, len(queries[0].input_tokens))
 
         return len(executor_request_ids)
-
-    @track_latencies
-    def _poll_responses(self):
-        """
-        Main response thread loop that collects outputs and invokes callbacks.
-
-        This method:
-        - Continuously polls the backend for responses
-        - Tracks latencies (TTFT, TPOT) for streaming mode
-        - Invokes complete_callback for each completed request
-        - Updates progress display with throughput metrics
-        - Handles both streaming and non-streaming modes
-
-        The thread continues running even after stop_work is signaled to ensure
-        all pending samples are completed before shutdown.
-        """
-        self.logger.debug(f"Core response thread started.")
-
-        # buffers for streaming mode
-        output_tokens: Dict[int, List[int]] = defaultdict(list)
-        first_token_latencies: Dict[int, int] = {}
-        last_token_latencies: Dict[int, int] = {}
-
-        while True:
-            with self.pending_samples_lock:
-                num_pending = len(self.pending_samples)
-
-            if num_pending == 0:
-                with self.flush_signal:
-                    self.flush_signal.notify()
-
-                if self.stop_work.is_set():
-                    break
-
-            timeout = datetime.timedelta(milliseconds=1)
-            responses = self._poll_responses_impl(timeout)
-
-            # batched updates for progress display
-            num_completed = 0
-            num_toks = 0
-            ttfts = []
-            tpots = []
-
-            for response in responses:
-                if response.error:
-                    # LLMCore is responsible to re-try this query, send another response
-                    self.logger.info(f"Response error for request {response.request_id}: {response.error}")
-                    continue
-
-                if self.harness_config.gen_config.streaming:
-                    # each response is 1 token in streaming mode
-                    is_first_token = response.request_id not in output_tokens
-                    is_final_token = response.is_final_token
-
-                    for beam, output_toks_ in enumerate(response.output_tokens):
-                        output_tokens[response.request_id].extend(output_toks_)
-                        num_output_toks = len(output_tokens[response.request_id])
-
-                        if not (is_first_token or is_final_token):
-                            continue
-
-                        assert (is_first_token and num_output_toks >= 1) or \
-                               (is_final_token and num_output_toks >= self.harness_config.gen_config.min_output_len)
-
-                        with self.pending_samples_lock:
-                            request_id, enqueue_time = self.pending_samples[response.request_id]
-                            flight_time = time.time() - enqueue_time
-
-                            if is_final_token:  # stop keeping track of id-mapping
-                                del self.pending_samples[response.request_id]
-
-                        output_toks = output_tokens[response.request_id]
-                        if num_output_toks <= 1:
-                            output_toks += [self.harness_config.gen_config.eos_token_id]
-                            num_output_toks += 1
-
-                        if not self.in_warmup_mode:
-                            self.complete_callback(request_id=request_id,
-                                                   output_tokens=output_toks,
-                                                   is_first_token=is_first_token and (not is_final_token))
-
-                        if is_first_token:
-                            first_token_latencies[response.request_id] = flight_time
-                            ttfts.append(flight_time)
-
-                        if is_final_token:
-                            last_token_latencies[response.request_id] = flight_time
-                            ttft = first_token_latencies[response.request_id]
-                            tpot = ttft if num_output_toks <= 1 else ((flight_time - ttft) / (num_output_toks - 1))
-                            tpots.append(tpot * 1000)
-
-                            num_completed += 1
-                            num_pending -= 1
-                            num_toks += num_output_toks
-                            del output_tokens[response.request_id]  # cleanup reference to output list
-
-                        self.logger.debug(f"Completed request #{request_id} "
-                                          f"(len={num_output_toks}, is_final={is_final_token}) "
-                                          f"[pending={num_pending}]")
-
-                        # we only consier beam=0 since ordering is in descending order of cumLogProbs
-                        # NOTE(vir): no model uses both streaming mode and >1 runtime_beams as of yet
-                        break
-
-                else:
-                    # each response is final in non-streaming mode
-                    assert response.is_final_token
-                    for beam, output_toks in enumerate(response.output_tokens):
-                        num_output_toks = len(output_toks)
-                        assert num_output_toks >= self.harness_config.gen_config.min_output_len
-
-                        with self.pending_samples_lock:
-                            request_id, enqueue_time = self.pending_samples.pop(response.request_id)
-
-                        if num_output_toks <= 1:
-                            output_toks += [self.harness_config.gen_config.eos_token_id]
-                            num_output_toks += 1
-
-                        if not self.in_warmup_mode:
-                            self.complete_callback(request_id=request_id,
-                                                   output_tokens=output_toks,
-                                                   is_first_token=False)
-
-                        num_completed += 1
-                        num_pending -= 1
-                        num_toks += num_output_toks
-                        self.logger.debug(f"Completed request #{request_id} "
-                                          f"(len={num_output_toks}, is_final=True)"
-                                          f"[pending={num_pending}]")
-
-                        # we only consier beam=0 since ordering is in descending order of cumLogProbs
-                        break
-
-            if not self.in_warmup_mode:
-                self.processed_count += num_completed
-                self._update_progress_display(num_completed, num_toks, ttfts, tpots)
-
-        self._cleanup_resources()
-        with self.pending_samples_lock:
-            assert len(self.pending_samples) == 0, f"Core stopped with self.pending_samples non-empty: {len(self.pending_samples)}"
-
-        self.response_thread_exit.set()  # disable flushing
-        with self.flush_signal:  # wake any pending flush
-            self.flush_signal.notify()
-
-        self.logger.debug(f"Core response thread complete.")
-
-    def _update_progress_display(self, num_completed, num_toks, ttfts, tpots, additional_unit_updates: Dict[str, Any] = {}):
-        """
-        Update the progress display with the latest batch of metrics.
-
-        Subclasses can override this to add backend-specific metrics (e.g., KV cache utilization for TRT-LLM executor).
-        Example:
-        >>> self.progress_display.record_iteration_stats(<trtllm-executor-stats>)
-
-        Args:
-        num_completed: Number of requests completed in this batch
-        num_toks: Total number of tokens generated in this batch
-        ttfts: List of TTFT measurements (seconds) for streaming mode
-        tpots: List of TPOT measurements (milliseconds) for streaming mode
-        additional_unit_updates: Backend-specific metrics to report
-        """
-        additional_unit_updates |= {'tokens/s': num_toks}
-        if self.harness_config.show_steady_state_progress:
-            additional_unit_updates |= {'steady_state_tokens/s': num_toks}
-        if self.harness_config.gen_config.streaming:
-            additional_unit_updates |= {'TTFT(s)': ttfts, 'TPOT(ms)': tpots}
-
-        self.progress_display.update(completed=num_completed, additional_unit_updates=additional_unit_updates)
 
     def notify_stop(self):
         """
@@ -358,6 +184,7 @@ class LLMCore(ABC):
         The core will not exit immediately but will wait for all in-flight
         requests to complete first.
         """
+        # Signal response thread to stop
         self.stop_work.set()
         with self.pending_samples_lock:
             self.logger.debug(f"notified to stop work, pending: {len(self.pending_samples)}")
@@ -375,6 +202,218 @@ class LLMCore(ABC):
                     self.flush_signal.wait()
         self.logger.debug(f"flush() completed.")
 
+    def _initialize_response_thread(self):
+        """
+        Initialize the response thread that polls for completed requests.
+
+        This should be called after the backend is fully initialized and ready
+        to process responses.
+
+        The response thread runs until notify_stop() is called.
+        """
+        if self.response_thread is not None:
+            self.logger.warning("Response thread already initialized")
+            return
+
+        self.response_thread = threading.Thread(target=self._poll_responses, args=())
+        self.response_thread.daemon = True
+        self.response_thread.start()
+
+    def _poll_responses(self):
+        """Per-core response polling thread that processes responses."""
+        # Response buffers, key: backend-request_id
+        stream_output_toks: Dict[int, List[int]] = defaultdict(list)
+        completed_output_toks: Dict[int, np.ndarray] = {}
+        first_token_latencies: Dict[int, float] = {}
+
+        while True:
+            with self.pending_samples_lock:
+                num_pending = len(self.pending_samples)
+
+            if num_pending == 0:
+                # awake any pending flush calls
+                with self.flush_signal:
+                    self.flush_signal.notify_all()
+
+                # core notified to stop work, exit the loop
+                if self.stop_work.is_set():
+                    break
+
+            # Poll for responses with small timeout
+            timeout = None  # datetime.timedelta(milliseconds=1)
+            responses = self._poll_responses_impl(timeout=timeout)
+
+            # Metrics for progress updates
+            num_completed = 0
+            num_toks = 0
+            ttfts = []
+            tpots = []
+
+            for response in responses:
+                if response.error:
+                    self.logger.info(f"Response error for request {response.request_id}: {response.error}")
+                    continue
+
+                if self.harness_config.gen_config.streaming:
+                    is_first_token = response.request_id not in stream_output_toks
+                    is_final_token = response.is_final_token
+
+                    for beam, chunk_output_toks in enumerate(response.output_tokens):
+                        stream_output_toks[response.request_id].extend(chunk_output_toks)
+                        response_num_output_toks = len(stream_output_toks[response.request_id])
+
+                        if response_num_output_toks == 0:
+                            # TODO(vir): investigate empty response
+                            self.logger.debug(f"Empty response for request {response.request_id}")
+                            continue
+
+                        if not (is_first_token or is_final_token):
+                            continue
+
+                        assert not self.in_warmup_mode or \
+                            (is_first_token and response_num_output_toks >= 1) or \
+                            (is_final_token and response_num_output_toks >= self.harness_config.gen_config.min_output_len), \
+                            f"Token validation failed: is_first_token={is_first_token}, num_output_toks={response_num_output_toks}, " \
+                            f"is_final_token={is_final_token}, min_output_len={self.harness_config.gen_config.min_output_len}"
+
+                        # update pending samples book-keeping
+                        with self.pending_samples_lock:
+                            server_request_id, enqueue_time = self.pending_samples[response.request_id]
+                            flight_time = time.time() - enqueue_time
+
+                            if is_final_token:
+                                # stop counting this sample as pending
+                                del self.pending_samples[response.request_id]
+
+                        # pad with EOS when response-len <= 1
+                        response_output_toks = stream_output_toks[response.request_id]
+                        if response_num_output_toks <= 1:
+                            response_output_toks += [self.harness_config.gen_config.eos_token_id]
+                            response_num_output_toks += 1
+
+                        if not self.in_warmup_mode:
+                            # complete this request
+                            completed_output_toks[response.request_id] = np.ascontiguousarray(response_output_toks, dtype=np.int32)
+                            self.complete_callback(
+                                request_id=server_request_id,
+                                is_first_token=is_first_token and (not is_final_token),
+                                output_toks=completed_output_toks[response.request_id],
+                                output_toks_len=response_num_output_toks
+                            )
+
+                            if is_first_token:
+                                first_token_latencies[response.request_id] = flight_time
+                                ttfts.append(flight_time)
+
+                                if self.latency_tracker is not None:
+                                    self.latency_tracker.add_TTFT(server_request_id, flight_time)
+
+                            if is_final_token:
+                                ttft = first_token_latencies[response.request_id]
+                                tpot = ttft if response_num_output_toks <= 1 else ((flight_time - ttft) / (response_num_output_toks - 1))
+                                tpots.append(tpot * 1000)
+
+                        if is_final_token:
+                            # cleanup tok-streaming buffer for this request
+                            # del stream_output_toks[response.request_id]
+
+                            num_completed += 1
+                            num_pending -= 1
+                            num_toks += response_num_output_toks
+
+                        self.logger.debug(f"Completed request #{server_request_id} "
+                                          f"(len={response_num_output_toks}, is_final={is_final_token}) [pending={num_pending}]")
+
+                        break  # Only consider beam=0, since ordering is in descending order of cumLogProbs
+
+                else:
+                    # Non-streaming mode
+                    assert response.is_final_token
+                    for beam, response_output_toks in enumerate(response.output_tokens):
+                        response_num_output_toks = len(response_output_toks)
+
+                        # update pending samples book-keeping
+                        with self.pending_samples_lock:
+                            server_request_id, _ = self.pending_samples.pop(response.request_id)
+
+                        if response_num_output_toks <= 1:
+                            response_output_toks += [self.harness_config.gen_config.eos_token_id]
+                            response_num_output_toks += 1
+
+                        if not self.in_warmup_mode:
+                            # complete this request
+                            completed_output_toks[response.request_id] = np.ascontiguousarray(response_output_toks, dtype=np.int32)
+                            self.complete_callback(
+                                request_id=server_request_id,
+                                is_first_token=False,
+                                output_toks=completed_output_toks[response.request_id],
+                                output_toks_len=response_num_output_toks
+                            )
+
+                        num_pending -= 1
+                        num_completed += 1
+                        num_toks += response_num_output_toks
+                        self.logger.debug(f"Completed request #{server_request_id} "
+                                          f"(len={response_num_output_toks}, is_final=True) [pending={num_pending}]")
+
+                        break  # Only consider beam=0
+
+            if num_completed > 0 and not self.in_warmup_mode:
+                # Update progress display if we have completed requests
+                self.processed_count += num_completed
+                self._update_progress_display(num_completed, num_toks, ttfts, tpots)
+
+            else:
+                # opportunistically collect garbage when no responses
+                if gc.get_count()[0] >= 10_000:
+                    gc.collect()
+
+        self._cleanup_resources()
+        with self.pending_samples_lock:
+            assert len(self.pending_samples) == 0, f"Core stopped with self.pending_samples non-empty: {len(self.pending_samples)}"
+
+        self.response_thread_exit.set()  # disable flushing
+        with self.flush_signal:  # wake any pending flush
+            self.flush_signal.notify_all()
+
+        self.logger.debug("Response collection thread complete.")
+
+    def _update_progress_display(self, num_completed, num_toks, ttfts, tpots, additional_unit_updates: Dict[str, Any] = {}):
+        """
+        Update the progress display with the latest batch of metrics.
+
+        Subclasses can override this to add backend-specific metrics (e.g., KV cache utilization for TRT-LLM executor).
+        Example:
+        >>> self.progress_display.record_iteration_stats(<trtllm-executor-stats>)
+
+        Args:
+            num_completed: Number of requests completed in this batch
+            num_toks: Total number of tokens generated in this batch
+            ttfts: List of TTFT measurements (seconds) for streaming mode
+            tpots: List of TPOT measurements (milliseconds) for streaming mode
+            additional_unit_updates: Backend-specific metrics to report
+        """
+        additional_unit_updates |= {'tokens/s': num_toks}
+        if self.harness_config.show_steady_state_progress:
+            additional_unit_updates |= {'steady_state_tokens/s': num_toks}
+        if self.harness_config.gen_config.streaming:
+            additional_unit_updates |= {'TTFT(s)': ttfts, 'TPOT(ms)': tpots}
+
+        self.progress_display.update(
+            completed=num_completed,
+            additional_unit_updates=additional_unit_updates,
+        )
+
+    def _cleanup_resources(self):
+        """Clean up resources including the response thread."""
+        pass
+
+    def __del__(self):
+        """Ensure completion of response thread on exit"""
+        if not self.response_thread_exit.is_set():
+            self.response_thread_exit.wait()
+        self.logger.info(f"Completed {self.processed_count} samples.")
+
     def _enqueue_impl(self, queries: List[LLMRequest]) -> List[int]:
         """
         Backend-specific implementation for enqueueing samples.
@@ -389,7 +428,7 @@ class LLMCore(ABC):
         """
         raise NotImplementedError()
 
-    def _poll_responses_impl(self, timeout: datetime.timedelta):
+    def _poll_responses_impl(self, timeout: Optional[datetime.timedelta] = None):
         """
         Backend-specific implementation for fetching responses.
 
@@ -397,21 +436,12 @@ class LLMCore(ABC):
         This method should return list of responses available, within given timeout.
 
         Args:
-            timeout: Maximum time to wait for responses
+            timeout: Maximum time to wait for responses (default=None)
 
         Returns:
             Generator/iterator of LLMResponse objects
         """
         raise NotImplementedError()
-
-    def _cleanup_resources(self):
-        """
-        Cleanup resources used by the core.
-
-        Subclasses can implement this to properly shutdown their backend, and free GPU memory.
-        This is called when the response thread exits after all pending requests are completed.
-        """
-        pass
 
     def get_num_warmup_iters(self):
         """ Get number of warmup iterations sufficient for this core. """
@@ -446,10 +476,10 @@ class LLMCore(ABC):
     @abstractmethod
     def get_config_for_core(cls,
                             core_index: int,
-                            complete_callback: Callable,
                             progress_display: LLMServerProgressDisplay,
                             verbose: bool,
                             verbose_nvtx: bool,
+                            complete_callback: Callable,
                             **kwargs) -> Dict[str, Any]:
         """
         Get complete configuration dict for a specific core instance.
@@ -457,10 +487,10 @@ class LLMCore(ABC):
 
         Args:
             core_index: Index of this core instance (0 to num_cores-1)
-            complete_callback: Callback to invoke on completion
             progress_display: Shared progress display
             verbose: Verbose logging flag
             verbose_nvtx: NVTX profiling flag
+            complete_callback: callback for completed requests
             **kwargs: Backend-specific parameters
 
         Returns:

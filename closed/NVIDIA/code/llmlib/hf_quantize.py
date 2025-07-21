@@ -526,6 +526,9 @@ def quantize_and_export(*,
             export_dir=export_path,
         )
 
+        # save tokenizer
+        tokenizer.save_pretrained(export_path)
+
         end_time = time.time()
         logger.info(
             "Quantized model exported to {} \nTotal time used {:.2f} s.".format(

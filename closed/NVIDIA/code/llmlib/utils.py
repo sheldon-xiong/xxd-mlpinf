@@ -18,10 +18,10 @@ import json
 import logging
 import os
 from pathlib import Path
-from statistics import mean, stdev
 import threading
 import time
 from typing import Any, Dict, List, Optional, Type
+import warnings
 
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -107,7 +107,15 @@ class PrefixLogger:
         func_name = frame.f_code.co_name
 
         # Get the 'self' argument from the frame's locals
-        self_arg = frame.f_locals.get('self')
+        # we supress runtime warnings on inspecting coroutines
+        self_arg = None
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            if 'self' in frame.f_locals:
+                potential_self = frame.f_locals['self']
+                if not inspect.iscoroutine(potential_self):
+                    self_arg = potential_self
+        
         if self_arg is not None:
             class_name = self_arg.__class__.__name__
         else:
@@ -143,60 +151,6 @@ class PrefixLogger:
 prefix_logger = PrefixLogger()
 
 
-def track_latencies(func):
-    """
-    A decorator to track the latencies of the invoked function across threads.
-    This tracks times at which each thread starts and ends the function.
-    It will additionally log out latency metrics.
-
-    Args:
-        func (function): The function to be decorated.
-
-    Returns:
-        function: The wrapped function with added tracking and logging.
-    """
-    state = {
-        'lock': threading.Lock(),
-        'start_times': {},
-        'end_times': {}
-    }
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        thread_id = threading.get_ident()
-
-        start_time = time.time()
-        with state['lock']:
-            state['start_times'][thread_id] = start_time
-
-        try:
-            result = func(*args, **kwargs)
-        finally:
-            end_time = time.time()
-            with state['lock']:
-                state['end_times'][thread_id] = end_time
-
-                # NOTE(vir): ideally we pass in total threads as decorator parameter
-                if len(state['start_times']) > 1 and len(state['end_times']) == len(state['start_times']):
-                    start_times_list = list(state['start_times'].values())
-                    end_times_list = list(state['end_times'].values())
-                    latencies = [end - start for start, end in zip(start_times_list, end_times_list)]
-                    tail_latency = max(end_times_list) - min(end_times_list)
-                    stdev_val = 0 if len(latencies) <= 1 else stdev(latencies)
-
-                    log_prefix = func.__name__
-                    if hasattr(args[0], '__class__'):
-                        log_prefix = f" [ {args[0].__class__.__name__}.{log_prefix} ] "
-
-                    logging.info(f"{log_prefix} - {len(latencies)} Thread(s) Summary : "
-                                 f"Mean Duration = {mean(latencies):.4f}s, "
-                                 f"Tail Latency = {tail_latency:.4f}s, "
-                                 f"Std Dev = {stdev_val:.4f}s")
-        return result
-
-    return wrapper
-
-
 class LLMServerProgressDisplay:
     """
     A tqdm wrapper to display llm-server progress.
@@ -205,8 +159,8 @@ class LLMServerProgressDisplay:
         update(completed=1):
             Updates the progress bar by a specified number of completed units.
 
-        update_total(total):
-            Updates the total number of units to process and refreshes the progress bar.
+        update(total=1):
+            Updates the progress bar total
 
         finish():
             Closes the progress bar.
@@ -244,7 +198,6 @@ class LLMServerProgressDisplay:
         self.state_history = {}
         self.iteration_stats = []
         self.progress_bar = None  # lazy init in update_total
-        self.start_time = None  # lazy init in update_total
 
         self.additional_units_specs = additional_units
         self.additional_units_values = {}
@@ -300,19 +253,30 @@ class LLMServerProgressDisplay:
                 case _:
                     raise ValueError(f"Unknown type({unit_type}) of additional unit({unit_name})")
 
-    def update(self, completed: int = 1, additional_unit_updates: Dict[str, int] = {}):
+    def update(self, completed: Optional[int] = None, additional_unit_updates: Dict[str, int] = {}):
         """
         Updates the progress bar by a specified number of completed units.
 
         Args:
-            completed (int): The number of units completed since the last update. Default is 1.
+            completed Optional[int]: The number of units completed since the last update. If provided, updates the completed count.
             additional Dict[str, int]: A dictionary of additional units completed since the last update.
         """
-        with self.lock:
-            if self.start_time is None:
-                self.start_time = time.time()
+        # no updates to render
+        if completed and (len(additional_unit_updates) == 0):
+            return
 
-            duration = self.progress_bar.format_dict['elapsed'] if self.progress_bar is not None else time.time() - self.start_time
+        # TODO(vir): ideally we co-schedule this with main thread using priority / move this to another thread
+        with self.lock:
+            self.completed += completed or 0
+            duration = 1
+
+            # lazy init progress bar
+            if self.progress_bar is None and self.enable_render:
+                self.progress_bar = tqdm(**self.progress_bar_args)
+                self.progress_bar.n = self.completed
+
+            else:
+                duration = self.progress_bar.format_dict.get('elapsed')
 
             for unit, update in additional_unit_updates.items():
                 match self.additional_units_specs[unit]:
@@ -325,58 +289,55 @@ class LLMServerProgressDisplay:
                     case 'throughput_tracker':
                         self.additional_units_values[unit].append(update, duration, completed)
 
-            displayed = completed > 0 and (self.progress_bar is not None and self.progress_bar.update(completed))
-            self.completed += completed
+            # we try-render update if completed > 0 (not on ONLY extra-stat updates)
+            if (render_update := completed > 0) and \
+                    self.progress_bar is not None and \
+                    self.progress_bar.update(completed):  # only render stats update if progress bar is rendered
+                instant_rate = self.progress_bar.format_dict.get('rate', 0.0)
+                mean_rate = float(self.completed / duration)
 
-        # NOTE(vir):
-        # we do a non-blocking attempt to grab the lock and update stats display
-        # whichever thread gets the lock will render a cumulative update
-        if displayed and self.lock.acquire(blocking=False):
-            rate = 0 if self.progress_bar.format_dict['rate'] is None else float(self.progress_bar.format_dict['rate'])
-            mean_rate = float(self.completed / duration)
+                additional_values = {}
+                for unit, _type in self.additional_units_specs.items():
+                    match _type:
+                        case 'mean':
+                            additional_values[unit] = float(self.additional_units_values[unit] / duration)
+                        case '99%':
+                            additional_values[unit] = self.additional_units_values[unit].p()
+                        case 'value':
+                            additional_values[unit] = float(self.additional_units_values[unit])
+                        case 'throughput_tracker':
+                            throughput = self.additional_units_values[unit].get_throughput()
+                            mean = throughput['mean']
+                            margin = throughput['margin']
 
-            additional_values = {}
-            for unit, _type in self.additional_units_specs.items():
-                match _type:
-                    case 'mean':
-                        additional_values[unit] = float(self.additional_units_values[unit] / duration)
-                    case '99%':
-                        if (top_p := self.additional_units_values[unit].p()) is not None:
-                            additional_values[unit] = top_p
-                    case 'value':
-                        additional_values[unit] = float(self.additional_units_values[unit])
-                    case 'throughput_tracker':
-                        additional_values[unit] = self.additional_units_values[unit].get_throughput()
+                            if mean == 0.0:
+                                display_str = 'cold-start'
+                            else:
+                                display_str = f"{mean:.1f}±{margin:.1f}"
 
-            samples_fmt = f'{rate:.2f}{self.unit}/s] Stats=[ {mean_rate:.2f} {self.unit}/s'
-            postfix_parts = [f', {value:.2f} {unit}' for unit, value in additional_values.items() if unit != 'steady_state_tokens/s']
-            if 'steady_state_tokens/s' in additional_values:
-                mean = additional_values['steady_state_tokens/s']['mean']
-                margin = additional_values['steady_state_tokens/s']['margin']
-                if mean == 0.0:
-                    steady_state_display = 'cold-start'
-                else:
-                    steady_state_display = f"{mean:.1f}±{margin:.1f}"
-                postfix_parts.append(f', {steady_state_display} steady_state_tokens/s')
+                            additional_values[unit] = display_str
 
-            postfix_fmt = ''.join(postfix_parts)
+                samples_fmt = f'{instant_rate:.2f}{self.unit}/s] Stats=[ {mean_rate:.2f} {self.unit}/s'
+                postfix_parts = [f', {value:.2f} {unit}' for unit, value in additional_values.items() if value is not None]
+                postfix_fmt = ''.join(postfix_parts)
 
-            self.progress_bar.set_postfix_str(f'{samples_fmt}{postfix_fmt} ', refresh=True)
-            self.state_history[self.completed] = additional_values
-            self.lock.release()
+                self.progress_bar.set_postfix_str(f'{samples_fmt}{postfix_fmt} ', refresh=True)
+                self.state_history[self.completed] = additional_values
 
     def update_total(self, total: int):
         """
         Updates the total number of units to process and refreshes the progress bar.
+        Assumes lock is held by the caller.
 
         Args:
             total (int): The new total number of units to process.
+
+        Returns:
+            bool: True if the total was updated, False if it was already set to this value.
         """
         with self.lock:
-            if self.start_time is None:
-                self.start_time = time.time()
-
             self.total = total
+            self.progress_bar_args['total'] = total
 
             if self.progress_bar is None:
                 if self.enable_render:
@@ -467,6 +428,53 @@ class LLMServerProgressDisplay:
                 time.sleep(1)
 
         logging.info(f"Harness iteration stats dumped to: {stats_file}")
+
+
+class LatencyTracker:
+    """
+    A thread-safe tracker for latency metrics of loadgen requests.
+
+    This class tracks Input Sequence Length (ISL) and Time To First Token (TTFT)
+    metrics for loadgen requests. It provides thread-safe operations for adding
+    samples and TTFT measurements, and can export the collected data to CSV format.
+
+    Methods:
+        add_sample(loadgen_request_id, ISL):
+            Adds a new sample with the given request ID and Input Sequence Length.
+
+        add_TTFT(loadgen_request_id, TTFT):
+            Adds Time To First Token measurement for an existing request.
+
+        gen_csv(output_path):
+            Generates a CSV file with all tracked latency data.
+    """
+
+    def __init__(self):
+        self.latency_tracker = {}
+        self.lock = threading.Lock()
+
+    def add_sample(self, loadgen_request_id, ISL):
+        with self.lock:
+            if loadgen_request_id not in self.latency_tracker:
+                logging.debug(f"Adding sample for request ID {loadgen_request_id} with ISL {ISL}")
+                self.latency_tracker[loadgen_request_id] = {"ISL": ISL, "TTFT": None, }
+            else:
+                raise ValueError(f"Request ID {loadgen_request_id} already exists in latency tracker, loadgen issued same request ID twice")
+
+    def add_TTFT(self, loadgen_request_id, TTFT):
+        # potential perf bottleneck when high token throughput inference is running on backend
+        with self.lock:
+            try:
+                logging.debug(f"Adding TTFT for request ID {loadgen_request_id} with TTFT {TTFT}")
+                self.latency_tracker[loadgen_request_id]["TTFT"] = TTFT
+            except KeyError:
+                raise KeyError(f"Request ID {loadgen_request_id} not found in latency tracker")
+
+    def gen_csv(self, output_path: str):
+        with open(output_path, 'w') as f:
+            f.write("loadgen_request_id,ISL,TTFT\n")
+            for loadgen_request_id, data in self.latency_tracker.items():
+                f.write(f"{loadgen_request_id},{data['ISL']},{data['TTFT']}\n")
 
 
 def get_yaml_string(config_dict, indent=0):

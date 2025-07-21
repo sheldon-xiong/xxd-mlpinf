@@ -33,7 +33,7 @@ EXPORTS = {
             'tokens_per_block': 32,
             'use_fp8_context_fmha': 'enable',
             'norm_quant_fusion': 'enable',
-            'gemm_plugin': 'fp4',
+            'gemm_allreduce_plugin': 'float16',
         },
         llm_fields.trtllm_checkpoint_flags: {
             'kv_cache_dtype': 'fp8',

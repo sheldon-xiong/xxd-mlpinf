@@ -63,6 +63,7 @@ benchmark_qsl_size_map["mixtral-8x7b"] = benchmark_qsl_size_map["mixtral-8x7b-99
 # NOTE(vir): primary name/key is 3_1 not 3.1
 benchmark_qsl_size_map['llama3_1-405b'] = benchmark_qsl_size_map['llama3.1-405b']
 
+
 # Check for query constraints documented in https://github.com/mlcommons/inference_policies/blob/master/inference_rules.adoc#scenarios
 _min_queries = model_config["min-queries"].copy()
 
@@ -232,7 +233,6 @@ class OfflineSettings(UserConf):
 
     def __post_init__(self):
         super().__post_init__()
-
         if self.test_run:
             self.min_query_count = 1
 
@@ -525,7 +525,8 @@ class LoadgenSettings:
                 C.Benchmark.Mixtral8x7B: "Original Huggingface model weights",
                 C.Benchmark.DeepSeek_R1: "Original Huggingface model weights",
                 C.Benchmark.SDXL: "Huggingface model weights hosted by MLCommons",
-                C.Benchmark.RGAT: "RGAT.pt hosted by MLCommons",
+                C.Benchmark.WHISPER: "Original Huggingface model weights",
+                C.Benchmark.RGAT: "RGAT.pt hosted by MLCommons"
             }
             weight_transformations_map = {
                 C.Benchmark.ResNet50: "quantization, affine fusion",
@@ -540,6 +541,8 @@ class LoadgenSettings:
                 C.Benchmark.DeepSeek_R1: "quantization, affine fusion",
                 C.Benchmark.SDXL: "quantization, affine fusion",
                 C.Benchmark.RGAT: "none",
+                C.Benchmark.WHISPER: "quantization, affine fusion",
+                C.Benchmark.RGAT: "none"
             }
 
         data = {
@@ -550,7 +553,7 @@ class LoadgenSettings:
             "weight_transformations": weight_transformations_map[self.benchmark]
         }
 
-        with (self.directory / f"{self.system_name}_{self.scenario.valstr}").open(mode='w') as f:
+        with (self.directory / f"{self.system_name}_{self.scenario.valstr}.json").open(mode='w') as f:
             json.dump(data, f, indent=4, sort_keys=True)
 
     def export_powersetting_adoc(self):

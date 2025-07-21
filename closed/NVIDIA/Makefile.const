@@ -135,6 +135,8 @@ NO_BUILD ?= 0
 NVIDIA_TRITON_SERVER_VERSION ?= 24.12
 export NVIDIA_TRITON_SERVER_VERSION
 
+# we see warnings when no default value is assigned
+NO_GPU_DETECTED ?= 0
 
 # SoC System
 ifeq ($(IS_SOC), 1)

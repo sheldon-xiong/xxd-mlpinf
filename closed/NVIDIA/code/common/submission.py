@@ -18,7 +18,7 @@ import textwrap
 import json
 from csv import DictWriter
 
-from code.common import logging, dict_get
+from code.common import logging
 from code.common.constants import Benchmark, Scenario
 
 
@@ -237,6 +237,7 @@ def generate_system_json(system_name, system_json_path, short_benchmark_name, in
             Benchmark.Mixtral8x7B: "Original Hugginface model weights",
             Benchmark.SDXL: "Hugginface model weights hosted by MLCommons",
             Benchmark.RGAT: "RGAT.pt",
+            Benchmark.WHISPER: "large-v3.pt",
         }
         weight_transformations_map = {
             Benchmark.ResNet50: "quantization, affine fusion",
@@ -249,6 +250,7 @@ def generate_system_json(system_name, system_json_path, short_benchmark_name, in
             Benchmark.Mixtral8x7B: "quantization, affine fusion",
             Benchmark.SDXL: "quantization, affine fusion",
             Benchmark.RGAT: "none",
+            Benchmark.WHISPER: "quantization, affine fusion",
         }
 
     data = {

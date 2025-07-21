@@ -39,4 +39,4 @@ export scenario
 export SYSTEM_NAME=$system_name
 
 cd /work
-make run_harness RUN_ARGS="--benchmarks=deepseek-r1 --scenarios=$scenario --core_type=trtllm_endpoint --model_path=$model_path"
+make run_harness RUN_ARGS="--benchmarks=deepseek-r1 --scenarios=$scenario --core_type=trtllm_endpoint --model_path=$model_path --trtllm_server_urls=0.0.0.0:30000"

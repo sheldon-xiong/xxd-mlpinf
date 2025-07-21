@@ -16,12 +16,13 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import tempfile
+import sys
 
+from code import G_BENCHMARK_MODULES
 from code.common import logging
 from code.common.systems.system_list import DETECTED_SYSTEM
 from code.common.triton.base_config import G_TRITON_BASE_CONFIG
-from code.common.workload import EngineIndex
+from code.common.workload import EngineIndex, Workload
 import code.fields.general as general_fields
 from code.fields import harness as harness_fields
 from code.llmlib.builder import TRTLLMBuilderOp, HFQuantizerOp
@@ -30,7 +31,7 @@ from nvmitten.configurator import autoconfigure, bind
 from nvmitten.nvidia.accelerator import GPU
 from nvmitten.pipeline import Operation
 
-from .config import TritonHarnessConfig, TrtllmEndpointConfig
+from .config import TritonHarnessConfig, TrtllmEndpointConfig, TrtllmDisaggEndpointConfig
 
 
 @autoconfigure
@@ -207,13 +208,17 @@ class RunTritonServerOp(Operation):
 @autoconfigure
 @bind(general_fields.log_dir)
 @bind(llm_fields.server_in_foreground)
+@bind(Workload.FIELD, "workload")
 class RunTrtllmServeOp(Operation):
+    """ Operation to run trtllm-serve endpoint(s) using trtllm-serve cli """
 
     def __init__(self,
                  log_dir: Path,
+                 workload: Workload,
                  server_in_foreground: bool = False):
         super().__init__()
         self.log_dir = log_dir
+        self.wl = workload
         self.blocking = server_in_foreground
 
         # Merge user flags with defaults
@@ -229,20 +234,33 @@ class RunTrtllmServeOp(Operation):
         self.devices = [gpu.gpu_index for gpu in gpus]
 
     def run(self, scratch_space, dependency_outputs):
-        # 1. Get modelname / checkpoint path
-        checkpoint_path = dependency_outputs[HFQuantizerOp]["quantized_checkpoint_path"]
-        assert Path(checkpoint_path).exists(), f"Checkpoint path {checkpoint_path} does not exist."
+        # 1. Get checkpoint / engine path
+        if self.harness_config.runtime_flags['trtllm_backend'] == 'pytorch':
+            target_path = dependency_outputs[HFQuantizerOp]["quantized_checkpoint_path"]
+            assert Path(target_path).exists(), f"Checkpoint path {target_path} does not exist."
+
+            self.tokenizer_path = target_path
+        else:
+            target_path = dependency_outputs[TRTLLMBuilderOp]["engine_dir"]
+            assert Path(target_path).exists(), f"Engine directory {target_path} does not exist."
+
+            model_repo = G_BENCHMARK_MODULES[self.wl.benchmark].load(('HF_MODEL_REPO',)).HF_MODEL_REPO
+            model_name, _ = list(model_repo.items())[0]
+
+            # TODO(vir):
+            # re-use local HF model path even in TRT mode
+            # instead of passing HF repo
+            self.tokenizer_path = model_name
 
         # 2. Calculate number of trtllm-serve commands to launch on this node
-        multinode_launch_mode = self.harness_config.multinode_world_size is not None
+        is_mpi_launch = self.harness_config.is_mpi_task
         gpus_per_server = self.harness_config.get_instance_size()
         launch_endpoints = self.harness_config.trtllm_endpoint_urls
-        if multinode_launch_mode:
-            launch_endpoints = [self.harness_config.get_endpoint_url_for_rank()]
 
         # 3. Create extra args yaml file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as extra_config:
-            extra_config.write(self.extra_config_yaml_contents)
+        extra_config_path = Path(self.log_dir) / "trtllm_serve_extra_conf.yaml"
+        with extra_config_path.open('w') as f:
+            f.write(self.extra_config_yaml_contents)
         logging.info(f"Extra Config YAML Contents:\n{self.extra_config_yaml_contents}")
 
         # 4. Launch trtllm-serve processes
@@ -253,7 +271,7 @@ class RunTrtllmServeOp(Operation):
             env = os.environ.copy()
 
             cmd = []
-            if multinode_launch_mode:
+            if is_mpi_launch:
                 # TODO(vir): remove hardcoded string
                 cmd = ['/work/build/TRTLLM/tensorrt_llm/llmapi/trtllm-llmapi-launch', 'trtllm-serve']
                 gpu_ids = None
@@ -266,16 +284,14 @@ class RunTrtllmServeOp(Operation):
                 env['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, gpu_ids))
 
             cmd.extend([
-                str(checkpoint_path),
-                # TODO(vir): collect actual list of endpoint urls using slurm
+                str(target_path),
                 '--host', '0.0.0.0',
                 '--port', str(endpoint_port),
-                '--extra_llm_api_options', extra_config.name
+                '--extra_llm_api_options', str(extra_config_path.absolute())
             ])
 
             # Add optional arguments only if they are not None
             optional_args = {
-                '--backend': self.trtllm_runtime_flags['trtllm_backend'],
                 '--num_postprocess_workers': self.trtllm_runtime_flags['num_postprocess_workers'],
                 '--tp_size': self.harness_config.tensor_parallelism,
                 '--pp_size': self.harness_config.pipeline_parallelism,
@@ -284,7 +300,11 @@ class RunTrtllmServeOp(Operation):
                 '--max_batch_size': self.trtllm_runtime_flags['max_batch_size'],
                 '--max_seq_len': self.trtllm_build_flags['max_seq_len'],
                 '--max_beam_width': self.trtllm_build_flags['max_beam_width'],
+                '--tokenizer': self.tokenizer_path,
             }
+
+            if self.trtllm_runtime_flags['trtllm_backend'] == 'pytorch':
+                optional_args |= {'--backend': self.trtllm_runtime_flags['trtllm_backend']}
 
             for arg_name, arg_value in optional_args.items():
                 if arg_value is not None:
@@ -319,4 +339,209 @@ class RunTrtllmServeOp(Operation):
 
     @classmethod
     def immediate_dependencies(cls):
+        if TrtllmEndpointConfig().runtime_flags['trtllm_backend'] == 'pytorch':
+            return {HFQuantizerOp}
+        else:
+            return {TRTLLMBuilderOp}
+
+
+@bind(general_fields.log_dir)
+@autoconfigure
+class GenerateTrtllmDisaggConfigOp(Operation):
+    def __init__(self, log_dir: Path):
+        super().__init__()
+        self.log_dir = log_dir
+
+        self.harness_config = TrtllmDisaggEndpointConfig()
+        self.trtllm_build_flags = self.harness_config.build_flags
+        self.trtllm_runtime_flags = self.harness_config.runtime_flags
+        self.trtllm_checkpoint_flags = self.harness_config.checkpoint_flags
+        self.extra_config_yaml_contents = self.harness_config.extra_config_yaml
+        assert self.harness_config.core_type == harness_fields.CoreType.TRTLLM_DISAGG
+
+    def run(self, scratch_space, dependency_outputs):
+        assert self.trtllm_runtime_flags['trtllm_backend'] == 'pytorch', "Can only be used with pytorch backend"
+        orchestrator_mode = not self.harness_config.is_mpi_task
+
+        target_path = dependency_outputs[HFQuantizerOp]["quantized_checkpoint_path"]
+        assert Path(target_path).exists(), f"Checkpoint path {target_path} does not exist."
+
+        if self.harness_config.disagg_config_path is not None:
+            disagg_config_file_path = Path(self.harness_config.disagg_config_path)
+        else:
+            disagg_config_file_path = Path(self.log_dir) / "trtllm_serve_disagg_config.yaml"
+
+        if disagg_config_file_path.exists():
+            logging.warning(f"Disagg config file {disagg_config_file_path} already exists, overwriting it.")
+
+        # TODO(vir): remove hardcoded path
+        gen_config_script_path = Path("/work/build/TRTLLM/docs/source/scripts/disaggregated/gen_yaml.py")
+        assert gen_config_script_path.exists(), f"Disagg config script {gen_config_script_path} does not exist"
+
+        logging.info(f"Generating disagg config yaml file at {disagg_config_file_path}")
+        gen_script_args = {
+            "config": disagg_config_file_path,
+            "model": target_path,
+            "num_ctx_servers": self.trtllm_runtime_flags['num_ctx_servers'],
+            "ctx_tp_size": self.trtllm_runtime_flags['ctx_tp_size'],
+            "ctx_batch_size": self.trtllm_runtime_flags['ctx_batch_size'],
+            "ctx_max_num_tokens": self.trtllm_runtime_flags['ctx_max_num_tokens'],
+            "ctx_enable_attention_dp": self.trtllm_runtime_flags['ctx_enable_attention_dp'],
+            "num_gen_servers": self.trtllm_runtime_flags['num_gen_servers'],
+            "gen_tp_size": self.trtllm_runtime_flags['gen_tp_size'],
+            "gen_batch_size": self.trtllm_runtime_flags['gen_batch_size'],
+            "gen_max_num_tokens": self.trtllm_runtime_flags['gen_max_num_tokens'],
+            "gen_enable_attention_dp": self.trtllm_runtime_flags['gen_enable_attention_dp'],
+            "gen_gpu_memory_fraction": self.trtllm_runtime_flags['gen_gpu_memory_fraction'],
+            "worker_start_port": self.trtllm_runtime_flags['worker_start_port'],
+            "server_port": self.trtllm_runtime_flags['server_port'],
+            "nsys_on": self.trtllm_runtime_flags['nsys_on'],
+        }
+        if orchestrator_mode:
+            # Get GPU devices to determine num_local_gpus
+            gpus = DETECTED_SYSTEM.accelerators[GPU]
+            num_local_gpus = len(gpus)
+
+            # Use mpirun when in orchestrator mode
+            gen_config_cmd = [
+                "mpirun",
+                "-n", str(num_local_gpus),
+                "python3",
+                str(gen_config_script_path),
+                *[f"--{key}={value}" for key, value in gen_script_args.items() if value],
+            ]
+        else:
+            # Use direct python3 when in leader mode
+            gen_config_cmd = [
+                "python3",
+                str(gen_config_script_path),
+                *[f"--{key}={value}" for key, value in gen_script_args.items() if value],
+            ]
+
+        # create custom env
+        custom_env = os.environ.copy()
+        custom_env['TRTLLM_ENABLE_PDL'] = str(int(self.trtllm_runtime_flags['enable_pdl'] == 1))
+
+        if os.environ.get('SLURM_JOB_NODELIST') is None:
+            custom_env['SLURM_JOB_NODELIST'] = 'localhost'
+            custom_env['SLURM_TASKS_PER_NODE'] = str(int(self.harness_config.global_size))
+
+        if orchestrator_mode:
+            logging.info(f"Generating disagg config yaml file with mpirun (orchestrator mode) using {num_local_gpus} GPUs:\n{' '.join(gen_config_cmd)}")
+        else:
+            logging.info(f"Generating disagg config yaml file with command (MPI mode):\n{' '.join(gen_config_cmd)}")
+        subprocess.run(gen_config_cmd, check=True, env=custom_env)
+
+        logging.info(f"Disagg config YAML file generated to: {disagg_config_file_path}")
+        return {"disagg_config_file_path": disagg_config_file_path}
+
+    @classmethod
+    def output_keys(cls):
+        return ["disagg_config_file_path"]
+
+    @classmethod
+    def immediate_dependencies(cls):
         return {HFQuantizerOp}
+
+
+@autoconfigure
+@bind(general_fields.log_dir)
+class RunTrtllmServeDisaggOp(Operation):
+    def __init__(self, log_dir: Path):
+        super().__init__()
+        self.log_dir = log_dir
+
+        # Merge user flags with defaults
+        self.harness_config = TrtllmDisaggEndpointConfig()
+        self.trtllm_build_flags = self.harness_config.build_flags
+        self.trtllm_runtime_flags = self.harness_config.runtime_flags
+        self.trtllm_checkpoint_flags = self.harness_config.checkpoint_flags
+        self.extra_config_yaml_contents = self.harness_config.extra_config_yaml
+        assert self.harness_config.core_type == harness_fields.CoreType.TRTLLM_DISAGG
+
+        # Get GPU devices
+        gpus = DETECTED_SYSTEM.accelerators[GPU]
+        self.devices = [gpu.gpu_index for gpu in gpus]
+
+    def run(self, scratch_space, dependency_outputs):
+        assert self.trtllm_runtime_flags['trtllm_backend'] == 'pytorch', "Can only be used with pytorch backend"
+        orchestrator_mode = not self.harness_config.is_mpi_task
+
+        # we expect disagg config to be specified in run_llm_server leader mode
+        self.disagg_config_file_path = self.harness_config.disagg_config_path
+        assert Path(self.disagg_config_file_path).exists(), f"Disagg config file {self.disagg_config_file_path} does not exist"
+
+        if orchestrator_mode:
+            self._launch_orchestrator_mode()
+        else:
+            self._launch_leader_mode()
+
+    def _launch_orchestrator_mode(self):
+        raise NotImplementedError("Orchestrator mode is not implemented yet. Please use leader mode for now.")
+
+    def _launch_leader_mode(self):
+        # TODO(vir): make this a field ?
+        launch_type = os.getenv("MLPERF_DISAGG_LAUNCH_TYPE", "worker")
+        assert launch_type in ["worker", "leader"], f"Invalid launch type: {launch_type}"
+
+        if launch_type == "leader":
+            # launch trtllm-disagg leader process
+            leader_log_file_path = self.log_dir / f"leader_log__{os.getenv('HOSTNAME', 'unknown')}_{os.getpid()}.log"
+
+            # Redirect stdout/stderr to log file before exec
+            logging.info(f"Starting disagg leader process inline")
+            logging.info(f"Log file: {leader_log_file_path}")
+
+            # Open log file and write initial info
+            with open(leader_log_file_path, 'a') as log_file:
+                log_file.write(f"Launch CMD: trtllm-serve disaggregated -c {self.disagg_config_file_path} -t 1800 -r 1800\n\n")
+                log_file.flush()
+
+                # Redirect stdout and stderr to log file
+                os.dup2(log_file.fileno(), sys.stdout.fileno())
+                os.dup2(log_file.fileno(), sys.stderr.fileno())
+
+            # Replace current process with leader command
+            # This preserves the MPI environment
+            # TODO(vir): fix hardcoded path
+            os.execv("/work/.llm_x86_64/bin/trtllm-serve", [
+                "trtllm-serve",
+                "disaggregated",
+                "--config", str(self.disagg_config_file_path),
+
+                # TODO(vir): change defaults if needed
+                "--server_start_timeout", "1800",
+                "--request_timeout", "1800"
+            ])
+
+        else:  # worker processes
+            # launch trtllm-disagg worker processes
+            # TODO(vir): remove hardcoded path
+            worker_script_path = Path("/work/build/TRTLLM/docs/source/scripts/disaggregated/start_worker.sh")
+            worker_log_file_path = self.log_dir / f"worker_log__{os.getenv('HOSTNAME', 'unknown')}_{os.getpid()}.log"
+
+            # Redirect stdout/stderr to log file before exec
+            logging.info(f"Starting disagg worker process inline")
+            logging.info(f"Log file: {worker_log_file_path}")
+
+            # Open log file and write initial info
+            with open(worker_log_file_path, 'a') as log_file:
+                log_file.write(f"Launch CMD: bash {worker_script_path} {self.disagg_config_file_path} {self.trtllm_runtime_flags['enable_pdl']}\n\n")
+                log_file.flush()
+
+                # Redirect stdout and stderr to log file
+                os.dup2(log_file.fileno(), sys.stdout.fileno())
+                os.dup2(log_file.fileno(), sys.stderr.fileno())
+
+            # Replace current process with the worker command
+            # This preserves the MPI environment
+            os.execv("/bin/bash", [
+                "bash",
+                str(worker_script_path),
+                str(self.disagg_config_file_path),
+                str(self.trtllm_runtime_flags['enable_pdl'])
+            ])
+
+    @classmethod
+    def immediate_dependencies(cls):
+        return {}

@@ -7,6 +7,7 @@ repo_root=$(git rev-parse --show-toplevel)
 username=$(whoami)
 
 output_dir=$repo_root/closed/NVIDIA/build/slurm_logs
+trtllm_backend="torch"
 
 usage="sbatch \\
     run_servers_and_harness.sh \\
@@ -16,9 +17,9 @@ usage="sbatch \\
     --scenario=value \\
     --benchmark_name=value \\
     --core_type=value \\
-    --model_path=value \\
     --num_instances_per_node=value \\
-    --system_name=value"
+    --system_name=value \\
+    --trtllm_backend=torch|trt"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -46,12 +47,16 @@ while [[ $# -gt 0 ]]; do
             core_type="${1#*=}"
             shift
             ;;
-        --model_path=*)
-            model_path="${1#*=}"
-            shift
-            ;;
         --num_instances_per_node=*)
             num_instances_per_node="${1#*=}"
+            shift
+            ;;
+        --system_name=*)
+            system_name="${1#*=}"
+            shift
+            ;;
+        --trtllm_backend=*)
+            trtllm_backend="${1#*=}"
             shift
             ;;
         --help|-h)
@@ -86,12 +91,6 @@ fi
 
 if [ -z "$core_type" ]; then
     echo "Error: core_type not specified"
-    echo "Usage: $usage"
-    exit 1
-fi
-
-if [ -z "$model_path" ]; then
-    echo "Error: model_path not specified"
     echo "Usage: $usage"
     exit 1
 fi
@@ -144,10 +143,14 @@ export container_mount="$actual_workdir:$container_workdir,$mlperf_scratch_path:
 export base_run_args="--benchmarks=$benchmark_name \
  --scenarios=$scenario \
  --core_type=$core_type \
- --engine_dir=$engine_dir \
-  --model_path=$model_path"
+ --engine_dir=$engine_dir"
+
+if [ "$trtllm_backend" == "trt" ]; then
+    export base_run_args="$base_run_args --trtllm_runtime_flags=trtllm_backend:cpp"
+fi
 
 export srun_header="srun --container-image=$mlperf_container_image --container-mounts=$container_mount --container-workdir=$container_workdir"
+
 
 ### If there is a unified file system, build the engine first which all trtllm-serve instances can use
 $srun_header \

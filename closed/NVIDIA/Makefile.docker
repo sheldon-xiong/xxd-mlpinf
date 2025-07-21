@@ -21,7 +21,7 @@ include $(CURDIR)/Makefile.build
 
 # Used in release process, Do not modify
 PARTNER_DROP = 1
-PARTNER_RELEASE := 2
+PARTNER_RELEASE := 3
 
 # Intranet returns zero, public network returns non zero
 # Force the EXTERNAL_USER to be 1 if the error code is other than 1
@@ -240,8 +240,9 @@ launch_docker:
 		--ulimit memlock=-1 \
 		-v $$SSH_AUTH_SOCK:/run/host-services/ssh-auth.sock \
 		-v /etc/timezone:/etc/timezone:ro -v /etc/localtime:/etc/localtime:ro \
+		-v /var/run/docker.sock:/var/run/docker.sock \
 		--security-opt apparmor=unconfined --security-opt seccomp=unconfined \
-		--name $(DOCKER_NAME) -h $(subst _,-,$(shell echo $(DOCKER_NAME) | cut -c -64)) --add-host $(DOCKER_NAME):127.0.0.1 \
+		--name $(DOCKER_NAME) -h $(subst _,-,$(shell echo $(DOCKER_NAME) | cut -c -64)) --add-host $(subst _,-,$(DOCKER_NAME)):127.0.0.1 \
 		--cpuset-cpus $(shell taskset -c -p $$$$ | awk '{print $$NF}') \
 		--user $(UID) --net host --device /dev/fuse \
 		$(DOCKER_MOUNTS) $(DOCKER_ARGS) \

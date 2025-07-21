@@ -14,9 +14,9 @@
 
 import importlib
 
-from code.llmlib import TrtllmExecutorClientHarnessOp, TritonClientHarnessOp, CoreType
+from code.llmlib import TrtllmExecutorClientHarnessOp, TritonClientHarnessOp, TrtllmServeClientHarnessOp, TrtllmHLApiClientHarnessOp, CoreType
 from code.llmlib.launch_server import GenerateTritonConfigOp, RunTritonServerOp, RunTrtllmServeOp  # noqa: F401
-from code.llmlib.builder import LLMComponentEngine, TRTLLMBuilderOp, TRTLLMQuantizerOp
+from code.llmlib.builder import LLMComponentEngine, TRTLLMBuilderOp, TRTLLMQuantizerOp, HFQuantizerOp # noqa: F401
 from .builder import LLAMA3_1QuantizerConfig as QuantizerConfig  # noqa: F401
 from .constants import LLAMA3_1Component as Component
 
@@ -28,9 +28,12 @@ COMPONENT_MAP = {
 }
 VALID_COMPONENT_SETS = {"gpu": [{Component.LLAMA3_1}]}
 DEFAULT_CORE_TYPE = CoreType.TRTLLM_EXECUTOR
+HF_MODEL_REPO = {"meta-llama/Llama-3.1-405B-Instruct": 'be673f326cab4cd22ccfef76109faf68e41aa5f1'}
 
 ComponentEngine = LLMComponentEngine
 CalibrateEngineOp = TRTLLMQuantizerOp
 EngineBuilderOp = TRTLLMBuilderOp
 TrtllmExecutorBenchmarkHarnessOp = TrtllmExecutorClientHarnessOp
 TritonBenchmarkHarnessOp = TritonClientHarnessOp
+TrtllmServeBenchmarkHarnessOp = TrtllmServeClientHarnessOp
+TrtllmHLApiBenchmarkHarnessOp = TrtllmHLApiClientHarnessOp

@@ -77,14 +77,13 @@ class TritonGrpcCore(LLMCore):
             )
             self.client_processes.append(client_process)
 
-        # start reponse thread after server ready
-        # warmup is managed by WarmupManager in LLMServer
-        self._initialize_response_thread()
-
         # Round-robin counter for distributing queries
         self.current_client_index = 0
         for client_process in self.client_processes:
             client_process.start()
+
+        # start response completion thread after init
+        self._initialize_response_thread()
 
     @staticmethod
     def _client_process_target(
@@ -307,14 +306,14 @@ class TritonGrpcCore(LLMCore):
 
     def _poll_responses_impl(self, timeout: datetime.timedelta):
         """Poll responses on the shared response queue"""
-        end_time = time.time() + timeout.total_seconds()
+        end_time = time.time() + timeout.total_seconds() if timeout is not None else 0
         responses = []
 
         # get all available responses without blocking
         try:
             while True:
                 result_id, output_ids, is_final_token = self.inference_response_queue.get_nowait()
-                responses.append(LLMResponse(request_id=result_id, output_tokens=output_ids, is_final_token=is_final_token))
+                responses.append(LLMResponse(request_id=result_id, output_tokens=output_ids, is_final_token=is_final_token, error=None))
         except mp.queues.Empty:
             pass
 
@@ -325,10 +324,10 @@ class TritonGrpcCore(LLMCore):
         # block for remaining time to see if responses come in
         try:
             result_id, output_ids, is_final_token = self.inference_response_queue.get(timeout=remaining_time)
-            responses.append(LLMResponse(request_id=result_id, output_tokens=output_ids, is_final_token=is_final_token))
+            responses.append(LLMResponse(request_id=result_id, output_tokens=output_ids, is_final_token=is_final_token, error=None))
             while True:
                 result_id, output_ids, is_final_token = self.inference_response_queue.get_nowait()
-                responses.append(LLMResponse(request_id=result_id, output_tokens=output_ids, is_final_token=is_final_token))
+                responses.append(LLMResponse(request_id=result_id, output_tokens=output_ids, is_final_token=is_final_token, error=None))
         except mp.queue.Empty:
             pass
 
@@ -347,13 +346,6 @@ class TritonGrpcCore(LLMCore):
         # Wait for all client processes to finish
         for process in self.client_processes:
             process.join()
-
-        # Signal response thread to stop
-        self.stop_work.set()
-
-        # Wait for response thread to finish
-        if self.response_thread and self.response_thread.is_alive():
-            self.response_thread.join()
 
         # Call parent class notify_stop
         super().notify_stop()
@@ -377,10 +369,10 @@ class TritonGrpcCore(LLMCore):
     @classmethod
     def get_config_for_core(cls,
                             core_index: int,
-                            complete_callback: Callable,
                             progress_display: LLMServerProgressDisplay,
                             verbose: bool,
                             verbose_nvtx: bool,
+                            complete_callback: Callable,
                             **kwargs) -> Dict[str, Any]:
         """Get configuration for a core instance """
         config = TritonHarnessConfig()
@@ -390,9 +382,9 @@ class TritonGrpcCore(LLMCore):
         return {
             'name': f'TritonGrpcCore#{core_index}_{config.server_url}_{config.model_name}',
             'harness_config': config,
-            'complete_callback': complete_callback,
             'progress_display': progress_display,
             'verbose': verbose,
             'verbose_nvtx': verbose_nvtx,
+            'complete_callback': complete_callback,
             'model_name': model_name,
         }

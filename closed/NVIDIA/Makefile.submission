@@ -87,7 +87,7 @@ stage_results:
 
 .PHONY: stage_compliance
 stage_compliance:
-	@STAGING_DIR=$(ARTIFACTS_STAGING) LOG_DIR="build/compliance_logs" $(PYTHON3_CMD) -m code.common.mlcommons.results
+	@STAGING_DIR=$(ARTIFACTS_STAGING) RESULTS_SEARCH_DIR="build/compliance_logs" $(PYTHON3_CMD) -m code.common.mlcommons.results
 
 
 .PHONY: truncate_results
@@ -103,7 +103,14 @@ truncate_results:
 .PHONY: summarize_results
 summarize_results: pull_artifacts_repo export_submission
 	$(MAKE) -f Makefile.submission check_submission "RUN_ARGS=--csv $(ARTIFACTS_DIR)/closed/NVIDIA/results/out.csv"
-	@$(PYTHON3_CMD) -m build.artifacts.closed.NVIDIA.scripts.results_analysis.summarize_results $(RUN_ARGS)
+	cp ../../build/submission/closed/NVIDIA/results/submission_checker_log.txt $(ARTIFACTS_DIR)/closed/NVIDIA/results/submission_checker_log.txt
+	$(MAKE) -f Makefile.docker prebuild \
+		DOCKER_DETACH=0 \
+		DOCKER_ARGS="-e PYTHONPATH=/work" \
+		DOCKER_COMMAND="bash -c '\
+		make build_loadgen && \
+		python3 -m pip install -r build/artifacts/closed/NVIDIA/scripts/results_analysis/requirements_gcp.txt && \
+		python3 -m build.artifacts.closed.NVIDIA.scripts.results_analysis.summarize_results $(RUN_ARGS)'"
 
 
 .PHONY: check_submission_staging

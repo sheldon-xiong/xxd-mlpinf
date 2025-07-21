@@ -70,7 +70,7 @@ class WarmupManager:
         for thread in threads:
             thread.join()
 
-        logging.info("All cores are healthy and ready.")
+        logging.info("All cores are ready.")
 
     def warmup(self, cores: List[LLMCore], warmup_queries: List[LLMRequest]):
         """Run the full warmup sequence: health checks + parallel warmup.
@@ -79,23 +79,50 @@ class WarmupManager:
             cores: List of LLMCore instances to warmup
             warmup_queries: List of warmup queries to run on each core
         """
+        # skip health check as well if no warmup queries provided
+        if len(warmup_queries) == 0:
+            return
+
         # First ensure all cores are healthy
         self._run_health_checks_with_retry(cores)
 
         logging.info(f"Warming up {len(cores)} cores in parallel with {len(warmup_queries)} queries each...")
+
+        # Track completion count
+        completed_count = 0
+        completed_lock = threading.Lock()
+        second_last_time = None
 
         def warmup_core_target(core: LLMCore):
             """Warmup target function for threading."""
             with core.warmup_mode():
                 core.enqueue(warmup_queries)
                 core.flush()
+            logging.debug(f"Core {core.name} warmup completed.")
+            
+            with completed_lock:
+                nonlocal completed_count, second_last_time
+                completed_count += 1
+                if completed_count == len(cores) - 1:
+                    second_last_time = time.time()
+                    logging.info(f"Second-to-last core completed. Will exit in 30s if last core doesn't complete.")
 
         # Run warmup in parallel
         threads = [threading.Thread(target=warmup_core_target, args=(core,)) for core in cores]
         for thread in threads:
             thread.start()
 
-        for thread in threads:
-            thread.join()
-
+        # Wait for threads with 30s timeout after second-to-last
+        while True:
+            alive_count = sum(1 for thread in threads if thread.is_alive())
+            
+            if alive_count == 0:
+                # All done
+                break
+                
+            with completed_lock:
+                if second_last_time and time.time() - second_last_time > 30:
+                    logging.error(f"Timeout: 30s passed since second-to-last core completed. Exiting with {alive_count} cores still running.")
+                    exit(-1)
+            
         logging.info("All cores warmed up successfully.")

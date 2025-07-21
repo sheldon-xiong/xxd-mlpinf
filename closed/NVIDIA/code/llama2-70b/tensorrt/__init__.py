@@ -13,7 +13,7 @@
 
 
 from code.llmlib import TrtllmExecutorClientHarnessOp, TritonClientHarnessOp, TrtllmServeClientHarnessOp, TrtllmHLApiClientHarnessOp, CoreType
-from code.llmlib.launch_server import GenerateTritonConfigOp, RunTritonServerOp, RunTrtllmServeOp  # noqa: F401
+from code.llmlib.launch_server import GenerateTritonConfigOp, RunTritonServerOp, RunTrtllmServeOp, GenerateTrtllmDisaggConfigOp, RunTrtllmServeDisaggOp  # noqa: F401 # noqa: F401
 from code.llmlib.builder import LLMComponentEngine, TRTLLMBuilderOp, TRTLLMQuantizerOp, HFQuantizerOp  # noqa: F401
 from .builder import LLAMA2QuantizerConfig as QuantizerConfig  # noqa: F401
 from .constants import LLAMA2Component as Component
@@ -33,3 +33,4 @@ TrtllmExecutorBenchmarkHarnessOp = TrtllmExecutorClientHarnessOp
 TritonBenchmarkHarnessOp = TritonClientHarnessOp
 TrtllmServeBenchmarkHarnessOp = TrtllmServeClientHarnessOp
 TrtllmHLApiBenchmarkHarnessOp = TrtllmHLApiClientHarnessOp
+TrtllmDisaggServeBenchmarkHarnessOp = TrtllmServeClientHarnessOp

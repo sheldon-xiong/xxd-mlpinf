@@ -44,13 +44,13 @@ sbatch \
     local_node_instance/run_servers_and_harness.sh \
     --mlperf_container_image=/path/to/sqsh \
     --mlperf_scratch_path=/path/to/scratch \
-    --trt_engine_artefacts=/path/to/high/vol/storage \ # This is ignored for now
+    --trt_engine_artefacts=/path/to/high/vol/storage \ # This is location of engine build only if --trtllm_backend=trt
     --scenario=Offline|Server \
     --benchmark_name=llama2-70b|mixtral-8x7b|llama3_1-405b \
     --core_type=trtllm_endpoint \
-    --model_path=/path/to/pytorch/model \
     --num_instances_per_node=4 \ # num GPUs a single instance occupies, <= 4
-    --system_name=SYSTEM_ID
+    --system_name=SYSTEM_ID \
+    --trtllm_backend=trt|torch
 ```
 
 ### Cross-node instance repro (DS-R1)
@@ -66,21 +66,22 @@ The target scripts are:
 ```bash
 sbatch \
     <slurm_flags>
-    local_node_instance/run_servers_and_harness.sh \
+    cross_node_instances/run_servers_and_harness.sh \
     --mlperf_container_image=/path/to/sqsh \
     --mlperf_scratch_path=/path/to/scratch \
     --trt_engine_artefacts=/path/to/high/vol/storage \ # This is ignored for now
     --scenario=Offline|Server \
-    --benchmark_name=llama2-70b|mixtral-8x7b|llama3_1-405b \
+    --benchmark_name=deepseek-r1 \
     --core_type=trtllm_endpoint \
-    --model_path=/path/to/pytorch/model \
-    --num_instances_per_node=4 # num GPUs a single instance occupies, <= 4
+    --gpus_per_instance=8  # must be > 4
 ```
+For multiple DP ranks, set the number of nodes accordingly. For example, for GB200 NVL, to run 2 ranks of DS-R1 on 8 GPUs each, use `--nodes=4` (16 GPUs) and `--gpus_per_instance=8`.
+
 Once the server is launched, you must run the benchmark client manually:
 
 - [`cross_node_instance/run_client.sh`](./cross_node_instances/run_client.sh)
   - Runs the `make run_harness` client
-  - Assumes the endpoint running on default URL `localhost:30000`
+  - Please add the `trtllm_server_urls` flag manually to provide the endpoint(s) that the trtllm-serve instances are running on
   - Usage:
 ```bash
 srun --overlap \
@@ -97,7 +98,6 @@ srun --overlap \
 
 ### TODOs:
 1. Cross-node: Launch the client in the same sbatch job
-2. Cross-node: DP>1.
-3. Audit runs
-4. `trtllm-serve` with TRT backend
-5. Override the system detection (NVL8, NVL63 or NVL72)
+2. Audit runs
+3. `trtllm-serve` with TRT backend
+4. Override the system detection (NVL8, NVL63 or NVL72)

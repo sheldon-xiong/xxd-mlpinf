@@ -3,8 +3,6 @@ import code.llmlib.fields as llm_fields
 import code.fields.models as model_fields
 import code.fields.loadgen as loadgen_fields
 import code.fields.harness as harness_fields
-import os
-os.environ["FORCE_NCCL_ALL_REDUCE_STRATEGY"] = "1"  
 
 EXPORTS = {
     C.WorkloadSetting(C.HarnessType.Custom, C.AccuracyTarget(0.99), C.PowerSetting.MaxP): {
@@ -33,7 +31,7 @@ EXPORTS = {
             'tokens_per_block': 32,
             'use_fp8_context_fmha': 'enable',
             'norm_quant_fusion': 'enable',
-            'gemm_plugin': 'fp4',
+            'gemm_allreduce_plugin': 'float16',
         },
         llm_fields.trtllm_checkpoint_flags: {
             'kv_cache_dtype': 'fp8',
