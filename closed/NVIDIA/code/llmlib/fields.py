@@ -74,6 +74,11 @@ enable_sort = Field(
     description="(Placeholder, not functional) Enable sorting of requests by token length (default=True).",
     from_string=bool)
 
+enable_ttft_latency_tracker = Field(
+    "enable_ttft_latency_tracker",
+    description="Enable latency tracker for TTFT(default=False).",
+    from_string=bool)
+
 triton_num_clients_per_server = Field(
     "triton_num_clients_per_server",
     description="Number of gRPC clients to use (each in separate process space) (default=1)",
@@ -162,3 +167,8 @@ warmup_iterations = Field(
     "warmup_iterations",
     description="Number of warmup iterations before actual benchmark. (default: auto-determined)",
     from_string=int)
+
+trtllm_disagg_config_path = Field(
+    "trtllm_disagg_config_path",
+    description="Path to the TRTLLM disaggregated config file. Required and used ONLY in --core_type=trtllm_disagg.",
+    from_string=pathlib.Path)

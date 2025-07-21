@@ -5,10 +5,13 @@
 
 num_nodes=$SLURM_JOB_NUM_NODES
 
+# Hardcoding the below number for GB200/GB300 systems
+gpus_per_node=4
+num_total_gpus=$((num_nodes * gpus_per_node))
+
 repo_root=$(git rev-parse --show-toplevel)
 username=$(whoami)
 output_dir=$repo_root/closed/NVIDIA/build/slurm_logs
-script_dir=$repo_root/closed/NVIDIA/scripts/slurm_llm
 
 usage="sbatch \\
     run_server.sh \\
@@ -105,6 +108,10 @@ if [ -z "$gpus_per_instance" ]; then
     exit 1
 fi
 
+num_server_instances=$((num_total_gpus / gpus_per_instance))
+num_nodes_per_server=$((num_nodes / num_server_instances))
+echo "Will spawn $num_server_instances server instances, each on $num_nodes_per_server nodes"
+
 # Export variables that will be used in srun commands
 export mlperf_container_image
 export mlperf_scratch_path
@@ -114,6 +121,7 @@ export benchmark_name
 export core_type
 
 export container_workdir="/work"
+export script_dir="$container_workdir/scripts/slurm_llm"
 export actual_workdir="${repo_root}/closed/NVIDIA"
 
 export server_container_name="mlperf_inference"
@@ -124,21 +132,25 @@ set -x
 export RUN_ARGS="--benchmarks=$benchmark_name \
  --scenarios=$scenario \
  --core_type=$core_type \
+ --trtllm_server_urls=0.0.0.0:30000 \
  --server_in_foreground"
 
 export server_srun_header="srun --container-image=$mlperf_container_image \
  --container-mounts=$container_mount \
  --container-workdir=$container_workdir \
+ --container-remap-root \
  --export=RUN_ARGS,script_dir \
  --mpi=pmix"
 
 # make run_llm_server
-$server_srun_header \
- --container-name=mlperf_inference-run_llm_server \
- --nodes=$num_nodes \
- --ntasks=$gpus_per_instance \
- --output=$output_dir/slurm-$SLURM_JOB_ID-server-launch-log.txt \
- /bin/bash -c 'source $script_dir/cross_node_instances/prefix.sh && make run_llm_server' &
+for i in $(seq 1 $num_server_instances); do
+    $server_srun_header \
+    --container-name=mlperf_inference-run_llm_server \
+    --nodes=$num_nodes_per_server \
+    --ntasks=$gpus_per_instance \
+    --output=$output_dir/slurm-$SLURM_JOB_ID-server-launch-log-$i.txt \
+    /bin/bash -c 'hostname && source $script_dir/cross_node_instances/prefix.sh && make run_llm_server' &
+done
 
 wait
 # sleep 60

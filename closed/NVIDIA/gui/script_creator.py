@@ -92,6 +92,7 @@ class ScriptWriter:
         if output_dir:
             self.header_lines.append(f"export LOG_DIR=\"{output_dir}\"")
         self.header_lines.append("export NO_DISPLAY_RESULTS=1")  # Don't display results until all workloads are done
+        self.header_lines.append(f"export RESULTS_SEARCH_DIR=\"{output_dir}\"")  # Force stage results to search in LOG_DIR
 
         if category == "Datacenter":
             self.scenarios = ["Offline", "Server"]

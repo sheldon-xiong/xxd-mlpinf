@@ -44,6 +44,10 @@ generate_conf_files:
 generate_triton_config:
 	@$(PYTHON3_CMD) -m code.main $(RUN_ARGS) --action="generate_triton_config"
 
+.PHONY: generate_disagg_config
+generate_disagg_config:
+	@$(PYTHON3_CMD) -m code.main $(RUN_ARGS) --action="generate_disagg_config"
+
 .PHONY: run_llm_server
 run_llm_server:
 	@$(PYTHON3_CMD) -m code.main $(RUN_ARGS) --action="run_llm_server"

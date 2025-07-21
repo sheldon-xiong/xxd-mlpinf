@@ -211,6 +211,12 @@ class Result:
         if self.benchmark_name not in requirements:
             return False
         if self.scenario not in requirements[self.benchmark_name]:
+            opt_key = "optional-scenarios-" + '-'.join(list(sorted(system_type.split(','))))
+            if opt_key in model_config:
+                opt_scenarios = model_config[opt_key]
+                if self.benchmark_name in opt_scenarios and self.scenario in opt_scenarios[self.benchmark_name]:
+                    logging.info(f"{self.scenario} is an optional scenario for {self.benchmark_name} - staging result.")
+                    return True
             return False
         return True
 
@@ -275,18 +281,18 @@ class Result:
             raise ValueError(f"Invalid test mode: {self.test_mode}")
 
 
-def enumerate_results(log_dir: os.PathLike):
+def enumerate_results(search_dir: os.PathLike):
     """
     Enumerate all results in the given log directory.
 
     Args:
-        log_dir: The directory to search for results.
+        search_dir: The directory to search for results.
 
     Returns:
         A dictionary of results, keyed by system name, benchmark name, and scenario.
     """
     base_dirs = set([os.path.dirname(f)
-                     for f in glob.glob(os.path.join(log_dir, "**", "mlperf_log_detail.txt"), recursive=True)])
+                     for f in glob.glob(os.path.join(search_dir, "**", "mlperf_log_detail.txt"), recursive=True)])
     results = {}
     for base_dir in base_dirs:
         res = Result(base_dir)
@@ -314,9 +320,9 @@ def enumerate_results(log_dir: os.PathLike):
     return results
 
 
-log_dir = Field("log_dir",
+search_dir = Field("search_dir",
                 description="The directory to search for results",
-                from_environ="LOG_DIR")
+                from_environ="RESULTS_SEARCH_DIR")
 
 staging_dir = Field("staging_dir",
                    description="The directory to copy results to",
@@ -335,14 +341,14 @@ submitter = Field("submitter",
 
 
 @autoconfigure
-@bind(log_dir)
+@bind(search_dir)
 @bind(staging_dir)
 @bind(dry_run)
 @bind(division)
 @bind(submitter)
 class StageResultsRunner:
     def __init__(self,
-                 log_dir: os.PathLike = "build/logs/default",
+                 search_dir: os.PathLike = "build/logs",  # Search *entire* logs directory by default
                  staging_dir: os.PathLike = "build/submission-staging",
                  dry_run: bool = False,
                  division: str = "closed",
@@ -352,9 +358,10 @@ class StageResultsRunner:
         self.division = division
         self.submitter = submitter
 
-        results = enumerate_results(log_dir)
+        results = enumerate_results(search_dir)
         for key, value in results.items():
             for test_mode, res in value.items():
+                logging.info(f"Found {test_mode} result for {key}")
                 res.copy_to(os.path.join(self.staging_dir, self.division, self.submitter), self.dry_run)
 
 

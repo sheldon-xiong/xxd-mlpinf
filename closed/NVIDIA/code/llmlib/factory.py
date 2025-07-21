@@ -11,35 +11,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
-from pathlib import Path
 from pprint import pformat
-from typing import Any, Callable, Dict, List, Type
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable, List
 
 import numpy as np
 
-from code.common.constants import Scenario
-from code.common.systems.system_list import DETECTED_SYSTEM
 from code.common.workload import Workload
 from code.fields.harness import CoreType
 import mlperf_loadgen as lg
-from nvmitten.nvidia.accelerator import GPU
 
-from .config import GenerationConfig, HarnessConfig
+from .config import HarnessConfig
 from .cores import BackendRegistry, LLMCore
 from .server import LLMServer
 from .utils import LLMServerProgressDisplay, prefix_logger as logging
 from .warmup import WarmupManager
 
 
-def complete_loadgen_request(request_id: int, output_tokens: List[int], is_first_token: bool):
+def complete_loadgen_request(
+    request_id: int,
+    is_first_token: bool,
+    output_toks: np.ndarray,
+    output_toks_len: int,
+):
+    """ Complete a Loadgen LLM request with first/final generated tokens. """
     complete_fn = lg.FirstTokenComplete if is_first_token else lg.QuerySamplesComplete
-    output_tokens = np.ascontiguousarray(output_tokens, dtype=np.uint32)
-    output_seq_len = len(output_tokens)
-    output_toks_ptr = output_tokens.ctypes.data
-    output_toks_size = output_seq_len * output_tokens.itemsize
-    complete_fn([lg.QuerySampleResponse(request_id, output_toks_ptr, output_toks_size, output_seq_len)])
+    complete_fn([lg.QuerySampleResponse(request_id, output_toks.ctypes.data, output_toks.nbytes, output_toks_len)])
 
 
 class LLMServerFactory:
@@ -75,10 +71,10 @@ class LLMServerFactory:
         for core_index in range(num_cores):
             core_kwargs = backend_class.get_config_for_core(
                 core_index=core_index,
-                complete_callback=complete_loadgen_request,
                 progress_display=progress_display,
                 verbose=verbose,
                 verbose_nvtx=verbose_nvtx,
+                complete_callback=complete_loadgen_request,
                 **backend_kwargs
             )
             core = backend_class(**core_kwargs)
@@ -106,6 +102,7 @@ class LLMServerFactory:
             harness_config=base_config,
             workload=workload,
             warmup_manager=warmup_manager,
+            complete_callback=complete_loadgen_request,
             verbose=verbose,
             verbose_nvtx=verbose_nvtx
         )

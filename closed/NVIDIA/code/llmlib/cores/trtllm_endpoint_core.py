@@ -28,17 +28,20 @@ import atexit
 import datetime
 import logging
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 from openai import AsyncOpenAI
 import uvloop
+uvloop.install()
+asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 from ..config import HarnessWorkerMode, TrtllmEndpointConfig
 from ..utils import LLMServerProgressDisplay
 from .base import LLMCore, LLMRequest, LLMResponse
-uvloop.install()
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+from .http_async_client import AsyncLLMHttpRequestManager
+from .openai_client_utils import OpenAIConcurrentRequestManager
 
 
 # Unified module-level event loop for all threading operations
@@ -126,8 +129,6 @@ _init_module_loop()
 atexit.register(_shutdown_module_loop)
 
 # Import the utilities after loop initialization to avoid circular imports
-from .openai_client_utils import OpenAIConcurrentRequestManager
-from .http_async_client import AsyncLLMHttpRequestManager
 
 
 class TrtllmEndpointCore(LLMCore):
@@ -145,7 +146,7 @@ class TrtllmEndpointCore(LLMCore):
         logging.getLogger('asyncio').setLevel(logging.CRITICAL)
 
         # Extract configuration parameters
-        self.model_repo = self.harness_config.model_repo
+        self.model_repo = self.harness_config.get_model_repo()
         self.model_name, self.model_revision = list(self.model_repo.items())[0]
         self.endpoint_url = self.harness_config.endpoint_url
         self.mode = self.harness_config.runtime_flags['harness_worker_mode']
@@ -154,32 +155,32 @@ class TrtllmEndpointCore(LLMCore):
 
         # Create concurrent request manager with pluggable implementation
         # Two implementations available:
-        # 1. OpenAI client-based
-        # 2. Lightweight HTTP + ZMQ + Msgpack implementation
+        # 1. OpenAI Async client-based
+        # 2. Lightweight HTTP implementation (aiohttp + ZMQ + Msgpack)
+        http_provider_cls = {
+            'openai_async': OpenAIConcurrentRequestManager,
+            'custom_http': AsyncLLMHttpRequestManager,
+        }[self.harness_config.runtime_flags['http_backend']]
 
-        # Option 1: Standard OpenAI client implementation
-        self._request_manager = OpenAIConcurrentRequestManager(
+        self._request_manager = http_provider_cls(
             config=self.harness_config,
             max_concurrency=self.max_concurrency,
             workers_per_core=self.workers_per_core,
             mode=self.mode,
+            log_dir=self.harness_config.log_dir
         )
 
-        # Option 2: lightweight HTTP + ZMQ + Msgpack implementation
-        # self._request_manager = AsyncLLMHttpRequestManager(
-        #     config=self.harness_config,
-        #     max_concurrency=self.max_concurrency,
-        #     workers_per_core=self.workers_per_core,
-        #     mode=self.mode,
-        # )
+        # Log initialization details for debugging and monitoring
+        self.logger.info(f"Initialized TrtllmEndpointCore with {self.workers_per_core} workers (endpoint_url: {self.endpoint_url}, max_concurrency: {self.max_concurrency})")
 
-        # Start response collection thread
+        # start response completion thread after init
         self._initialize_response_thread()
 
-        # Log initialization details for debugging and monitoring
-        worker_info = f"with {self.workers_per_core} workers, " if self.mode == HarnessWorkerMode.MULTIPROCESS else ""
-        self.logger.info(f"Initialized TrtllmEndpointCore in {self.mode.value} mode "
-                         f"{worker_info}{self.max_concurrency} max concurrency (endpoint_url: {self.endpoint_url})")
+    def _cleanup_resources(self):
+        """Clean up resources when core is deleted."""
+        self._request_manager.shutdown()
+        _shutdown_module_loop()  # Ensure module loop is shutdown
+        super()._cleanup_resources()
 
     def run_health_check(self):
         """Check if underlying TRT-LLM server is healthy"""
@@ -202,9 +203,6 @@ class TrtllmEndpointCore(LLMCore):
                         limits=httpx.Limits(max_keepalive_connections=None, max_connections=None)
                     ),
                 )
-
-                # First check: Verify API endpoint is accessible
-                models = await health_check_client.models.list()
 
                 # Second check: Verify generation capability with minimal request
                 test_response = await health_check_client.chat.completions.create(
@@ -245,23 +243,18 @@ class TrtllmEndpointCore(LLMCore):
         Returns:
             List[int]: List of request IDs that were submitted
         """
+        assert not self.stop_work.is_set()
         self._request_manager.submit_requests(queries)
         request_ids = [query.request_id for query in queries]
         return request_ids
 
-    def _poll_responses_impl(self, timeout: datetime.timedelta) -> List[LLMResponse]:
+    def _poll_responses_impl(self, timeout: Optional[datetime.timedelta] = None) -> List[LLMResponse]:
         """
         Get responses from the request manager within the specified timeout.
 
         This method implements the LLMCore interface for response polling.
         It delegates to the configured request manager, which collects
         responses from HTTP requests and returns them in the expected format.
-
-        Args:
-            timeout (datetime.timedelta): Maximum time to wait for responses
-
-        Returns:
-            List[LLMResponse]: All responses collected within the timeout period
         """
         responses = self._request_manager.get_responses(timeout)
         return responses
@@ -279,27 +272,27 @@ class TrtllmEndpointCore(LLMCore):
         Calculate the number of LLM Cores cores needed for the workload.
         We do 1 LLMCore instance per endpoint.
         """
-        return TrtllmEndpointConfig().get_num_endpoints()
+        return len(cls.CONFIG_T().trtllm_endpoint_urls)
 
     @classmethod
     def get_config_for_core(cls,
                             core_index: int,
-                            complete_callback: Callable,
                             progress_display: LLMServerProgressDisplay,
                             verbose: bool,
                             verbose_nvtx: bool,
+                            complete_callback: Callable,
                             model_path: str,
                             **kwargs) -> Dict[str, Any]:
         """Get configuration for a core instance """
-        config = TrtllmEndpointConfig(**kwargs)
+        config = cls.CONFIG_T(**kwargs)
         config.model_path = model_path
         config.endpoint_url = config.trtllm_endpoint_urls[core_index]
 
         return {
             'name': f'TrtllmEndpointCore#{core_index}',
             'harness_config': config,
-            'complete_callback': complete_callback,
             'progress_display': progress_display,
             'verbose': verbose,
             'verbose_nvtx': verbose_nvtx,
+            'complete_callback': complete_callback,
         }

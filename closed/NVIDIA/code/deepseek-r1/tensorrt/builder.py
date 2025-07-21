@@ -60,8 +60,13 @@ class DeepSeek_R1QuantizerConfig(QuantizerConfig):
         self.pp_size = pp_size
         self.moe_ep_size = moe_ep_size
 
-        # TODO(vir):
-        # enable build custom checkpoint for dsr1
+        ckpt_dir_map = {Precision.FP8: 'fp8-quantized-modelopt',
+                        Precision.FP4: 'fp4-quantized-modelopt',
+                        Precision.NVFP4: 'fp4-quantized-modelopt'}
+        if dtype_out not in ckpt_dir_map:
+            raise ValueError(f"Unsupported Precision for DeepSeek-R1: {dtype_out.valstr}")
+
+        self.hf_output_path = output_path / ckpt_dir_map[dtype_out] / f"{model_name}-torch-{dtype_out.valstr}"
 
         super().__init__(*args,
                          model_path=model_path,

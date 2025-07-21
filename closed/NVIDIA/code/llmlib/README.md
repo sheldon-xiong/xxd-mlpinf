@@ -183,7 +183,33 @@ To add a new inference backend:
 3. **Implement lifecycle methods**:
    - `warm_up()`: Run warmup queries (optional, base class has default)
    - `flush()`: Flush all pending queries (optional, base class has default)
-   - `_cleanup_resources()`: Clean up backend resources (optional)
 4. **Create configuration class**: Extend `HarnessConfig` with backend-specific settings
 5. **Register the backend**: Update `BackendRegistry` class with new module path
 6. **Add harness operation**: Create a corresponding harness op in `__init__.py` if needed
+
+### Using Trtllm Disaggregated Serving
+
+Running Locally:
+
+```bash
+export DISAGG_CONFIG_PATH=/work/disagg_config.yaml
+export RUN_ARGS="--benchmarks=llama2-70b --scenarios=offline --core_type=trtllm_disagg --trtllm_disagg_config_path=$DISAGG_CONFIG_PATH"
+export INSTANCE_SIZE=? # <num_ctx_servers * num_gpus_per_ctx_server + num_gen_servers * num_gpus_per_gen_server>
+
+# generate config file at --trtllm_disagg_config_path
+mpirun -n $INSTANCE_SIZE make generate_disagg_config RUN_ARGS=$RUN_ARGS
+
+# launch disagg-workers with config file at --trtllm_disagg_config_path
+# these are individual gen and context servers
+# NOTE use of `&` to launch these processes in background
+MLPERF_DISAGG_LAUNCH_TYPE=worker mpirun -n $INSTANCE_SIZE make run_llm_server RUN_ARGS=$RUN_ARGS &
+
+# launch endpoint with config file at --trtllm_disagg_config_path
+# this awaits init of all worker serers launched in previous step
+# NOTE use of `&` to launch this process in background
+MLPERF_DISAGG_LAUNCH_TYPE=leader mpirun -n 1 make run_llm_server RUN_ARGS=$RUN_ARGS &
+
+# run harness, will use endpoint from -trtllm_disagg_config_path
+make run_harness RUN_ARGS=$RUN_ARGS
+```
+

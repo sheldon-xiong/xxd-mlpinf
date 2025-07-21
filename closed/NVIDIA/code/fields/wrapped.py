@@ -21,10 +21,6 @@ import code.fields.gen_engines as builder_fields
 import code.fields.general as general_fields
 import code.fields.models as model_fields
 import code.fields.harness as harness_fields
-import code.fields.loadgen as lg_fields
-import code.fields.meta as meta_fields
-import code.fields.power as power_fields
-import code.fields.triton as triton_fields
 import dataclasses as dcls
 import nvmitten.nvidia.builder as MBuilder
 import typing
@@ -44,7 +40,7 @@ _builder_bindings = [bind(model_fields.precision),
                      bind(harness_fields.gpu_copy_streams, "num_profiles"),
                      bind(general_fields.verbose),
                      bind(general_fields.verbose_nvtx)]
-if "is_soc" in DETECTED_SYSTEM.extras["tags"]:
+if "tags" in DETECTED_SYSTEM.extras and "is_soc" in DETECTED_SYSTEM.extras["tags"]:
     _builder_bindings.append(bind(model_fields.dla_core))
 
 for binding in _builder_bindings:

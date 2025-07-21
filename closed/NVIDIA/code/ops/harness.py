@@ -38,8 +38,7 @@ import mlperf_loadgen as lg
 # Local imports
 from ..common import args_to_string
 from ..common.constants import Benchmark, Scenario, AuditTest
-from ..common.mlcommons.accuracy_checker import check_accuracy
-from ..common.mlcommons.compliance import set_audit_conf, get_audit_verifier
+from ..common.mlcommons.compliance import get_audit_verifier
 from ..common.mlcommons.lg_logs import LoadgenLogReader, result_key
 from ..common.mlcommons.loadgen import QUERY_METRIC_CONSTRAINTS, LogOutputSettings, LogSettings
 from ..common.mlcommons.runner import ScopedQSL, ScopedSUT

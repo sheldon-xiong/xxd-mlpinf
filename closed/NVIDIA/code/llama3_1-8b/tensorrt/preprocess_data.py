@@ -57,12 +57,13 @@ def preprocess_cnndailymail_prompt(data):
 
     return sources, targets
 
+
 def preprocess_cnndailymail_gptj6b(data_dir, preprocessed_data_dir):
     cnn_val_json_path = os.path.join(
         data_dir, "llama3.1-8b", "cnn_eval.json")
-    output_dir = os.path.join(preprocessed_data_dir,
-                              "llama3.1-8b")
-    
+    output_dir = Path(preprocessed_data_dir) / "llama3.1-8b"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     logging.info("Reading CNN dailymail examples...")
     df = pd.read_json(cnn_val_json_path)
     toks = df['tok_input'].to_list()

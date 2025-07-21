@@ -32,7 +32,7 @@ from .paths import VERSION_FILE
 
 with VERSION_FILE.absolute().open(mode='r') as fh:
     __MLPERF_INF_VERSION__ = fh.readline().strip('\n')
-__MLPERF_INF_PAST_VERSIONS__ = ["v4.0", "v3.1", "v3.0", "v2.1", "v2.0", "v1.1", "v1.0", "v0.7", "v0.5"]
+__MLPERF_INF_PAST_VERSIONS__ = ["v5.0", "v4.1", "v4.0", "v3.1", "v3.0", "v2.1", "v2.0", "v1.1", "v1.0", "v0.7", "v0.5"]
 
 
 def args_to_string(d, blacklist=[], delimit=True, double_delimit=False):

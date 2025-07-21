@@ -22,6 +22,7 @@ import queue
 import signal
 import time
 import os
+from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
 from tokenizers import Tokenizer as AutoTokenizer
@@ -48,10 +49,9 @@ def _cleanup_worker_processes():
     global _active_worker_processes
     for process in _active_worker_processes:
         if process.is_alive():
+            process.join(timeout=0.2)
             process.terminate()
-            process.join(timeout=1.0)
-            if process.is_alive():
-                process.kill()
+            process.kill()
     _active_worker_processes.clear()
 
 
@@ -95,7 +95,7 @@ class WorkerProcessManager:
                 target=worker_main_func,
                 args=(*init_args, i, readiness_queue),
                 name=f"{process_name_prefix}-{i}",
-                daemon=True
+                daemon=False
             )
             process.start()
             worker_processes.append(process)
@@ -116,6 +116,11 @@ class WorkerProcessManager:
         except (queue.Empty, RuntimeError) as e:
             # On failure, terminate all started processes
             logging.error(f"Worker startup failed: {e}. Terminating workers.")
+
+            # Clean up the readiness queue before handling the error
+            readiness_queue.close()
+            readiness_queue.join_thread()
+
             for p in worker_processes:
                 if p.is_alive():
                     p.terminate()
@@ -131,6 +136,10 @@ class WorkerProcessManager:
 
         elapsed = time.time() - start_time
         logging.debug(f"All {worker_count} worker processes ready in {elapsed:.2f}s")
+
+        # Clean up the readiness queue to prevent semaphore leaks
+        readiness_queue.close()
+        readiness_queue.join_thread()
 
         return worker_processes
 
@@ -148,16 +157,17 @@ class WorkerProcessManager:
 
         # Wait for processes to finish
         for process in worker_processes:
-            process.join(timeout=5.0)
+            process.join(timeout=0.1)
             if process.is_alive():
                 process.terminate()
-                process.join()
+                process.kill()
+
             # Remove from active processes registry
             if process in _active_worker_processes:
                 _active_worker_processes.remove(process)
 
 
-def setup_logging_for_worker(worker_id: int):
+def setup_logging_for_worker(worker_id: int, log_dir: str):
     """Common logging setup for worker processes to write to a dedicated file."""
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -167,3 +177,33 @@ def setup_logging_for_worker(worker_id: int):
     logging.getLogger('httpx').setLevel(logging.WARNING)
     logging.getLogger('httpcore').setLevel(logging.WARNING)
     logging.getLogger('asyncio').setLevel(logging.WARNING)
+
+    # Assert that log_dir is valid
+    assert log_dir is not None and Path(log_dir).exists(), f"valid log_dir must be provided, given: {log_dir}"
+
+    # Create log file based on PID
+    pid = os.getpid()
+    log_file = os.path.join(log_dir, f"worker_{worker_id}_pid_{pid}.log")
+
+    # Create file handler
+    file_handler = logging.FileHandler(log_file, mode='a')
+    file_handler.setLevel(logging.INFO)
+
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - [Worker-%(worker_id)s/PID-%(process)d] - %(message)s',
+        defaults={'worker_id': worker_id}
+    )
+    file_handler.setFormatter(formatter)
+
+    # Remove existing handlers and add the file handler
+    logger.handlers.clear()
+    logger.addHandler(file_handler)
+
+    # Also add console handler for critical errors
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.ERROR)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    logger.info(f"Worker {worker_id} (PID: {pid}) logging initialized")

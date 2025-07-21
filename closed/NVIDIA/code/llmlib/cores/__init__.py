@@ -26,6 +26,7 @@ class BackendRegistry:
         CoreType.TRTLLM_EXECUTOR: ('trtllm_executor_core', 'TrtllmExecutorCore'),
         CoreType.TRITON_GRPC: ('triton_grpc_core', 'TritonGrpcCore'),
         CoreType.TRTLLM_ENDPOINT: ('trtllm_endpoint_core', 'TrtllmEndpointCore'),
+        CoreType.TRTLLM_DISAGG: ('trtllm_disagg_endpoint_core', 'TrtllmDisaggEndpointCore'),
         CoreType.TRTLLM_HLAPI: ('trtllm_hlapi_core', 'TrtllmHlApiCore'),
     }
 

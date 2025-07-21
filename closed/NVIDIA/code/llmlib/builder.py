@@ -22,6 +22,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from code.common.constants import Benchmark
 from code.common import paths
 from code.common.constants import Precision
 from code.common.workload import ComponentEngine, EngineIndex, Workload
@@ -232,6 +233,9 @@ HelpInfo.add_configurator_dependencies(TRTLLMQuantizerOp,
 @bind(builder_fields.force_calibration, "force")
 @bind(llm_fields.quantizer_outdir, "output_path")
 class HFQuantizerOp(Operation):
+
+    SCRIPT_QUANTIZABLE_BENCHMARKS = [Benchmark.LLAMA2]
+
     @classmethod
     def immediate_dependencies(cls):
         return None
@@ -243,6 +247,8 @@ class HFQuantizerOp(Operation):
     def __init__(self,
                  *args,
                  workload: Optional[Workload] = None,
+                 lib_path: Optional[os.PathLike] = Path("/work/code/llmlib"),
+                 script_path: os.PathLike = Path("hf_quantize.py"),
                  quantizer_config: Optional[QuantizerConfig] = None,
                  force: bool = False,
                  output_path: Optional[os.PathLike] = None,
@@ -260,24 +266,52 @@ class HFQuantizerOp(Operation):
         else:
             self.quantizer_config = quantizer_config
 
+        # Technically not TRTLLM loader, but reusing the code
+        self.trtllm_loader = TRTLLMLibraryLoader(lib_path=lib_path)
+        self.script_path = Path(script_path)
+        if not (script_location := self.trtllm_loader.lib_path / script_path).exists():
+            raise FileNotFoundError(f"Could not locate HF quantization script at: {script_location}")
+
+        assert self.quantizer_config.hf_output_path is not None, "hf_output_path is required"
+
         self.force = force
-        self.output_path = output_path
+        self.custom_env = None
+
+    def get_cli_flags(self) -> List[str]:
+        _d = {"model_dir": str(self.quantizer_config.model_path.absolute()),
+              "output_dir": str(self.quantizer_config.hf_output_path.absolute()),
+              "calib_dataset": str(self.quantizer_config.dataset_path.absolute()),
+              "calib_size": self.quantizer_config.batch_size * self.quantizer_config.max_batches,
+              "dtype": "float16" if self.quantizer_config.dtype_in == Precision.FP16 else "bfloat16",
+              "qformat": self.quantizer_config.dtype_out.valstr.lower()}
+        _d |= self.quantizer_config.flags
+
+        return [f"--{k}={v}" for k, v in _d.items() if v is not None]
 
     def run(self, scratch_space, dependency_outputs):
-        if self.output_path is not None:
-            # use --llm-quantizer-outdir directly if provided
-            out_dir = Path(self.output_path)
-
-        else:
-            # using model_path itself as checkpoint path
-            out_dir = self.quantizer_config.model_path.absolute()
-
+        out_dir = self.quantizer_config.hf_output_path.absolute()
         if not self.force and out_dir.exists():
             logging.info(f"Quantized checkpoint already exists at: {out_dir}. Set --force_calibration to overwrite.")
             return {"quantized_checkpoint_path": out_dir}
 
-        # TODO(vir): implement checkpoint, revision validation
-        raise NotImplementedError("Please follow <workload>/README.md for instructions on how to download HF checkpoint.")
+        if self.wl.benchmark not in self.SCRIPT_QUANTIZABLE_BENCHMARKS:
+            raise ValueError(f"{self.wl.benchmark} cannot be quantized by the script. Please follow <workload>/README.md to download the checkpoint and place it at {out_dir}.")
+
+        if not out_dir.exists():
+            out_dir.mkdir(parents=True)
+
+        ret, duration = self.trtllm_loader(str(self.script_path),
+                                           self.get_cli_flags(),
+                                           python_bin=self.wl.benchmark.python_path,
+                                           log_dir=out_dir,
+                                           custom_env=self.custom_env)
+
+        if ret.returncode != 0:
+            logging.error(ret.stderr)
+            raise RuntimeError(f"Quantization failed. Logs dumped to: {out_dir}")
+
+        logging.info(f"Quantization complete in {duration}s. Saved to: {out_dir}")
+        return {"quantized_checkpoint_path": out_dir}
 
 
 HelpInfo.add_configurator_dependencies(HFQuantizerOp, {QuantizerConfig})
@@ -345,7 +379,7 @@ class TRTLLMBuilderOp(Operation):
             raise KeyError(f"'tensor_parallelism' should not be specified in TRTLLM flags. Use --{llm_fields.tensor_parallelism.name} instead.")
         if "pipeline_parallelism" in self.build_flags:
             raise KeyError(f"'pipeline_parallelism' should not be specified in TRTLLM flags. Use --{llm_fields.pipeline_parallelism.name} instead.")
-        if "max_batch_size" in self.build_flags:
+        if "max_batch_size" in self.build_flags and not "whisper" in self.wl.benchmark.valstr:
             raise KeyError(f"'max_batch_size' should not be specified in TRTLLM flags. Use --gpu_batch_size instead.")
 
     def get_cli_flags(self) -> List[str]:

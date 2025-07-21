@@ -14,8 +14,9 @@
 from code import G_BENCHMARK_MODULES
 import contextlib
 import gc
-import os
 from typing import List, Optional, Tuple
+
+import numpy as np
 
 from code.common.workload import Workload
 from code.fields import general as general_fields
@@ -27,10 +28,16 @@ import mlperf_loadgen as lg
 from nvmitten.configurator import autoconfigure, bind
 
 from . import fields as llm_fields
-from .utils import LazyImport
+from .config import TrtllmDisaggEndpointConfig, TrtllmEndpointConfig, TrtllmHlApiConfig
 from .cores import LLMRequest
 from .factory import LLMServerFactory
+from .utils import LazyImport
 from .utils import prefix_logger as logging
+
+# we use faulthandler for better stack traces
+import faulthandler
+faulthandler.enable()
+
 
 # NOTE(vir):
 # Lazy import builder operations to avoid trtllm dependency
@@ -114,7 +121,7 @@ class LLMHarnessOp(PyHarnessOp):
     @contextlib.contextmanager
     def wrap_lg_test(self, scratch_space, dependency_outputs):
         try:
-            # Use factory to create complete server
+            # Use factory to create LLMServer instance
             self.server = LLMServerFactory.create_server(
                 backend_type=self.core_type,
                 workload=self.wl,
@@ -129,14 +136,20 @@ class LLMHarnessOp(PyHarnessOp):
             self.server.warm_up(warmup_iters=self.warmup_iterations)
             logging.info("Server warmup completed.")
 
+            # Disable automatic garbage collection for test-run
+            # We run GC opportunistically in LLMServer
+            logging.warning(f"Disabled automatic garbage collection for the test run.")
+            gc.disable()
             gc.collect()
-            gc.disable()  # We have no idea why this is needed, but without it, the SUT segfaults immediately
 
             yield None
         finally:
+            # we notify LLMServer to cleanup using stop_work()
+            # this is where we dump all stats and metrics to file and cleanup the server and cores
             if self.server:
                 self.server.stop_work()
 
+            # re-enable automatic GC
             gc.enable()
 
     def get_backend_kwargs(self, dependency_outputs):
@@ -164,6 +177,29 @@ class TrtllmServeClientHarnessOp(LLMHarnessOp):
 
     @classmethod
     def immediate_dependencies(cls):
+        if TrtllmEndpointConfig().runtime_flags['trtllm_backend'] == 'pytorch':
+            return {LoadgenConfFilesOp, HFQuantizerOp._load()}
+        else:
+            return {LoadgenConfFilesOp, TRTLLMBuilderOp._load()}
+
+    def get_backend_kwargs(self, dependency_outputs):
+        if TrtllmEndpointConfig().runtime_flags['trtllm_backend'] == 'pytorch':
+            model_path = dependency_outputs[HFQuantizerOp._load()]["quantized_checkpoint_path"]
+        else:
+            model_path = dependency_outputs[TRTLLMBuilderOp._load()]["engine_dir"]
+
+        return super().get_backend_kwargs(dependency_outputs) | {
+            'model_path': model_path
+        }
+
+
+@autoconfigure
+class TrtllmDisaggServeClientHarnessOp(TrtllmServeClientHarnessOp):
+    """LLM Harness Operation with trtllm-serve-disag endpoint based inference"""
+
+    @classmethod
+    def immediate_dependencies(cls):
+        assert TrtllmDisaggEndpointConfig().runtime_flags['trtllm_backend'] == 'pytorch'
         return {LoadgenConfFilesOp, HFQuantizerOp._load()}
 
     def get_backend_kwargs(self, dependency_outputs):
@@ -178,7 +214,10 @@ class TrtllmHLApiClientHarnessOp(LLMHarnessOp):
 
     @classmethod
     def immediate_dependencies(cls):
-        return {LoadgenConfFilesOp, HFQuantizerOp._load()}
+        if TrtllmHlApiConfig().runtime_flags['trtllm_backend'] == 'pytorch':
+            return {LoadgenConfFilesOp, HFQuantizerOp._load()}
+        else:
+            return {LoadgenConfFilesOp, TRTLLMBuilderOp._load()}
 
     def get_backend_kwargs(self, dependency_outputs):
         return super().get_backend_kwargs(dependency_outputs) | {

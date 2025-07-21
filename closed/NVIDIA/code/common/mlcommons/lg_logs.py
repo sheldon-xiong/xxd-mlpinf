@@ -97,12 +97,12 @@ def result_key(benchmark: C.Benchmark, scenario: C.Scenario) -> str:
     elif scenario == C.Scenario.MultiStream:
         return "result_99.00_percentile_per_query_latency_ns"
     elif scenario == C.Scenario.Offline:
-        if benchmark.is_llm:
+        if benchmark is not None and (benchmark.is_llm or benchmark is C.Benchmark.WHISPER):
             return "result_tokens_per_second"
         else:
             return "result_samples_per_second"
     elif scenario in (C.Scenario.Server, C.Scenario.Interactive):
-        if benchmark.is_llm:
+        if benchmark is not None and benchmark.is_llm:
             return "result_completed_tokens_per_second"
         else:
             return "result_completed_samples_per_sec"
@@ -153,7 +153,6 @@ class LoadgenLogReader:
             detail = base_path / "mlperf_log_detail.txt"
             if not detail.exists():
                 raise FileNotFoundError("log_dir was explicitly provided, but detail log does not exist.")
-
 
         self.log_settings = LoadgenLogSettings()
         self.log_paths = LogPaths(base_path,

@@ -24,6 +24,7 @@ without any actual inference. Useful for:
 from copy import deepcopy
 from typing import List, Tuple, Dict, Any, Callable
 import datetime
+import time
 
 from ..config import HarnessConfig
 from ..utils import LLMServerProgressDisplay
@@ -43,7 +44,6 @@ class DummyCore(LLMCore):
 
     def __init__(self, **kwargs):
         self.num_requests_received = 0
-        self.pending_sample_ids = set()
         super().__init__(**kwargs)
 
     def _enqueue_impl(self, queries: List[LLMRequest]) -> List[int]:
@@ -53,10 +53,8 @@ class DummyCore(LLMCore):
         """
         num_new_requests = len(queries)
         self.num_requests_received += num_new_requests
-        new_request_ids = [q.request_id for q in queries]
-        self.pending_sample_ids.update(new_request_ids)
-        # self.logger.info(f"Received {num_new_requests} requests: {self.pending_sample_ids}")
-        return new_request_ids
+        # Return same request_ids (no translation needed for dummy)
+        return [q.request_id for q in queries]
 
     def _poll_responses_impl(self, _: datetime.timedelta):
         """Return fixed responses for all pending requests
@@ -64,25 +62,21 @@ class DummyCore(LLMCore):
         Immediately returns a hardcoded token sequence for each pending request.
         This simulates instant inference with zero latency.
         """
-        for sample_id in self.pending_sample_ids:
-            yield LLMResponse(
-                request_id=sample_id,
-                output_tokens=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]],  # Fixed 10-token response
-                is_final_token=True,
-                error=None
-            )
-        self.pending_sample_ids.clear()
+        # Create responses for all pending requests
+        responses = []
+        with self.pending_samples_lock:
+            for executor_id, (request_id, enqueue_time) in list(self.pending_samples.items()):
+                responses.append(LLMResponse(
+                    request_id=executor_id,  # Use executor_id temporarily
+                    output_tokens=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]],  # Fixed 10-token response
+                    is_final_token=True,
+                    error=None,
+                ))
 
-    def warm_up(self, warm_up_iters: int = 100):
-        """No-op warmup since dummy core has no state to initialize"""
-        pass
+        return responses
 
     def flush(self):
         """No-op flush since responses are returned immediately"""
-        pass
-
-    def run_health_check(self):
-        """No-op health check for dummy backend"""
         pass
 
     @classmethod
@@ -98,7 +92,6 @@ class DummyCore(LLMCore):
     def get_config_for_core(cls,
                             core_index: int,
                             base_config: HarnessConfig,
-                            complete_callback: Callable,
                             progress_display: LLMServerProgressDisplay,
                             verbose: bool,
                             verbose_nvtx: bool,
@@ -112,7 +105,6 @@ class DummyCore(LLMCore):
             # Common kwargs
             'name': f'DummyCore#{core_index}',
             'harness_config': deepcopy(base_config),
-            'complete_callback': complete_callback,
             'progress_display': progress_display,
             'verbose': verbose,
             'verbose_nvtx': verbose_nvtx,

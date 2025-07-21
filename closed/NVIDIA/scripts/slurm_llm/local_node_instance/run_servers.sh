@@ -7,7 +7,7 @@
 repo_root=$(git rev-parse --show-toplevel)
 username=$(whoami)
 output_dir=$repo_root/closed/NVIDIA/build/slurm_logs
-export script_dir=$repo_root/closed/NVIDIA/scripts/slurm_llm
+trtllm_backend="torch"
 
 usage="sbatch \\
     run_servers.sh \\
@@ -16,7 +16,8 @@ usage="sbatch \\
     --trt_engine_artefacts=value \\
     --scenario=value \\
     --benchmark_name=value \\
-    --core_type=value"
+    --core_type=value \\
+    --trtllm_backend=torch|trt"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -42,6 +43,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --core_type=*)
             core_type="${1#*=}"
+            shift
+            ;;
+        --trtllm_backend=*)
+            trtllm_backend="${1#*=}"
             shift
             ;;
         --help|-h)
@@ -88,6 +93,7 @@ export engine_dir="/home/artefacts/engines/mlperf-engine_$benchmark_name.$scenar
 
 export container_workdir="/work"
 export actual_workdir="${repo_root}/closed/NVIDIA"
+export script_dir=$container_workdir/scripts/slurm_llm
 
 export server_container_name="mlperf_inference"
 export container_mount="$actual_workdir:$container_workdir,$mlperf_scratch_path:/home/mlperf_inference_storage,$trt_engine_artefacts:/home/artefacts"
@@ -98,14 +104,18 @@ export RUN_ARGS="--benchmarks=$benchmark_name \\
  --engine_dir=$engine_dir \\
  --server_in_foreground"
 
-export server_srun_header="srun --container-image=$mlperf_container_image --container-mounts=$container_mount --container-workdir=$container_workdir --export=RUN_ARGS"
+if [ "$trtllm_backend" == "trt" ]; then
+    export RUN_ARGS="$RUN_ARGS --trtllm_runtime_flags=trtllm_backend:cpp"
+fi
+
+export server_srun_header="srun --container-image=$mlperf_container_image --container-mounts=$container_mount --container-workdir=$container_workdir"
 
 ### If there is a unified file system, build the engine first which all trtllm-serve instances can use
 $server_srun_header \
  --container-name=$server_container_name-generate_engines \
  --nodes=1 \
  --output=$output_dir/slurm-$SLURM_JOB_ID-generate_engines.txt \
- --export=script_dir \
+ --export=script_dir,RUN_ARGS \
  --mpi=pmix \
  /bin/bash -c 'source $script_dir/local_node_instance/prefix.sh && make generate_engines'
 
@@ -117,7 +127,7 @@ for node in $node_list; do
     $server_srun_header \
         --container-name=$server_container_name-run_llm_server \
         --nodes=1 \
-        --export=script_dir \
+        --export=script_dir,RUN_ARGS \
         -w $node \
         --output=$output_dir/slurm-$SLURM_JOB_ID-$node-server-launch-log.txt \
         /bin/bash -c 'source $script_dir/local_node_instance/prefix.sh && make run_llm_server' &

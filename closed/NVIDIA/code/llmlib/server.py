@@ -15,9 +15,8 @@ from __future__ import annotations
 from collections import defaultdict
 import os
 import signal
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional
 
-import numpy as np
 import numpy as np
 import psutil
 
@@ -25,9 +24,9 @@ from code.common import logging
 from code.common.utils import nvtx_scope
 from code.common.workload import Workload
 
-from .config import GenerationConfig, HarnessConfig
+from .config import HarnessConfig
 from .cores import LLMCore, LLMRequest
-from .utils import LLMServerProgressDisplay, prefix_logger as logging
+from .utils import LLMServerProgressDisplay, LatencyTracker, PrefixLogger
 from .warmup import WarmupManager
 
 
@@ -65,6 +64,7 @@ class LLMServer:
         harness_config: HarnessConfig,
         workload: Workload,
         warmup_manager: WarmupManager,
+        complete_callback: Callable,
         verbose: bool = False,
         verbose_nvtx: bool = False
     ):
@@ -78,6 +78,7 @@ class LLMServer:
             harness_config: Harness configuration
             workload: MLPerf workload
             warmup_manager: Manager for parallel warmup and health checks
+            complete_callback: Callback function for completed requests
             verbose: Verbose logging flag
             verbose_nvtx: NVTX instrumentation flag
         """
@@ -87,12 +88,25 @@ class LLMServer:
         self.harness_config = harness_config
         self.wl = workload
         self.warmup_manager = warmup_manager
+        self.complete_callback = complete_callback
         self.verbose = verbose
         self.verbose_nvtx = verbose_nvtx
         self.sample_count = 0
+        self.logger = PrefixLogger(prefix=f"LLMServer-{os.getpid()}")
+
+        if self.harness_config.enable_ttft_latency_tracker and self.harness_config.gen_config.streaming:
+            self.latency_tracker = LatencyTracker()
+            for c in cores:
+                self.logger.info(f"tracking latency for core {c.name}")
+                c.latency_tracker = self.latency_tracker
+
+            self.max_concurrent_request_per_core = 0
+        else:
+            self.latency_tracker = None
+            self.max_concurrent_request_per_core = -1
 
         setup_interrupt_handler(self)
-        logging.info(f"LLMServer initialized with {len(self.cores)} cores")
+        self.logger.info(f"LLMServer initialized with {len(self.cores)} cores")
 
     def warm_up(self, warmup_iters: Optional[int] = None):
         """
@@ -105,11 +119,11 @@ class LLMServer:
             # some cores (eg: triton with multiple clients) may require extended warmups
             warmup_iters = max([core.get_num_warmup_iters() for core in self.cores])
 
-        # Create warmup queries with random tokens (ids=[1, 100))
+        # Create warmup queries with random tokens (ids=[1, 100), input-len=[90, 300))
         warmup_queries = [
             LLMRequest(
                 request_id=i,
-                input_tokens=np.random.randint(1, 100, size=100).tolist(),
+                input_tokens=np.random.randint(1, 100, size=np.random.randint(90, 300)).tolist(),
                 stop_tokens=None
             )
             for i in range(warmup_iters)
@@ -125,33 +139,37 @@ class LLMServer:
         Args:
             query_samples: List of LLMRequest objects
         """
-        # Distribute queries to cores
-        samples_per_core = defaultdict(list)
-        for query in query_samples:
-            samples_per_core[self.get_next_core()].append(query)
+        with nvtx_scope("issue_queries"):
+            # Distribute queries to cores
+            samples_per_core = defaultdict(list)
+            for query in query_samples:
+                samples_per_core[self.get_next_core()].append(query)
 
-        # Enqueue batches
-        for core, samples in samples_per_core.items():
-            self.sample_count += core.enqueue(samples)
+            # Enqueue batches
+            for core, samples in samples_per_core.items():
+                self.sample_count += core.enqueue(samples)
+            self.progress_display.update_total(total=self.sample_count)
 
-        # Update progress
-        self.progress_display.update_total(self.sample_count)
+            # track runtime max concurrency for server scenario
+            if self.verbose and self.harness_config.gen_config.streaming:
+                queue_sizes = {core.name: core.get_num_pending_samples() for core in self.cores}
+                self.logger.debug(f"Issued +{len(query_samples)} samples. Core Load: {queue_sizes}")
 
-        if self.verbose:
-            queue_sizes = {core.name: core.get_num_pending_samples() for core in self.cores}
-            logging.debug(f"Issued +{len(query_samples)} samples. Core Load: {queue_sizes}")
+                max_core_name, max_core_pending_size = max(queue_sizes.items(), key=lambda x: x[1])
+                self.max_concurrent_request_per_core = max(max_core_pending_size)
+                self.logger.debug(f"core {max_core_name} reached a higher concurrency per core: {self.max_concurrent_request_per_core}")
 
     def flush_queries(self):
         """Block until all pending queries complete"""
-        logging.debug("flush_queries() invoked.")
+        self.logger.debug("flush_queries() invoked.")
         with nvtx_scope("flush_queries"):
             for core in self.cores:
                 core.flush()
-        logging.debug("flush_queries() completed.")
+        self.logger.debug("flush_queries() completed.")
 
     def stop_work(self):
         """Stop accepting new requests and cleanup"""
-        logging.debug("stop_work() invoked.")
+        self.logger.debug("stop_work() invoked.")
         with nvtx_scope("stop_work"):
             # Signal cores to stop
             for core in self.cores:
@@ -164,5 +182,8 @@ class LLMServer:
             self.progress_display.finish()
             self.cores.clear()
 
-        logging.info(f"Total Samples Completed: {self.sample_count}")
-        logging.debug("stop_work() completed.")
+        if self.latency_tracker is not None:
+            self.latency_tracker.gen_csv(self.wl.log_dir / "latency.csv")
+
+        self.logger.info(f"Total Samples Completed: {self.sample_count}")
+        self.logger.debug("stop_work() completed.")

@@ -3,8 +3,7 @@ import code.llmlib.fields as llm_fields
 import code.fields.models as model_fields
 import code.fields.loadgen as loadgen_fields
 import code.fields.harness as harness_fields
-import os
-os.environ["FORCE_NCCL_ALL_REDUCE_STRATEGY"] = "1"  
+ 
 EXPORTS = {
     C.WorkloadSetting(C.HarnessType.Custom, C.AccuracyTarget(0.99), C.PowerSetting.MaxP): {
         model_fields.gpu_batch_size: {

@@ -31,6 +31,7 @@ from code.llmlib.builder import QuantizerConfig
 
 @autoconfigure
 @bind(model_fields.model_path)
+@bind(llm_fields.quantizer_outdir, "output_path")
 @bind(builder_fields.calib_data_dir, "dataset_path")
 @bind(model_fields.precision, "dtype_out")
 @bind(llm_fields.tensor_parallelism, "tp_size")
@@ -44,6 +45,7 @@ class LLAMA3_1QuantizerConfig(QuantizerConfig):
                  *args,
                  model_name: str = "llama3.1-405b-instruct-hf",
                  model_path: os.PathLike = paths.MODEL_DIR / "Llama3.1-405B/Meta-Llama-3.1-405B-Instruct",
+                 output_path: os.PathLike = paths.MODEL_DIR / "Llama3.1-405B",
                  dataset_path: os.PathLike = paths.BUILD_DIR / "preprocessed_data/llama3.1-405b/mlperf_llama3.1_405b_dataset_512_processed_fp16_calibration",
                  dtype_out: Precision = Precision.FP4,
                  tp_size: int = 1,
@@ -57,7 +59,8 @@ class LLAMA3_1QuantizerConfig(QuantizerConfig):
 
         # To support testing multiple variants, we used the following naming schema to store each of them
         variant_dir = f"{model_name}-tp{tp_size}pp{pp_size}-{dtype_out.valstr}"
-        output_path = paths.MODEL_DIR / "Llama3.1-405B" / ckpt_dir_map[dtype_out] / variant_dir
+        self.hf_output_path = output_path / ckpt_dir_map[dtype_out] / f"{model_name}-torch-{dtype_out.valstr}"
+        output_path = output_path / ckpt_dir_map[dtype_out] / variant_dir
 
         super().__init__(*args,
                          model_path=model_path,

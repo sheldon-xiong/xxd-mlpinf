@@ -19,6 +19,7 @@ from __future__ import annotations
 import datetime
 import json
 from pathlib import Path
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from code.common.systems.system_list import DETECTED_SYSTEM
@@ -124,15 +125,8 @@ class TrtllmExecutorCore(LLMCore):
             seed=self.harness_config.random_seed,
         )
 
-        # Start response thread after executor init
+        # start response completion thread after init
         self._initialize_response_thread()
-
-    def __del__(self):
-        """Ensure proper cleanup by waiting for response thread to exit"""
-        if not self.response_thread_exit.is_set():
-            self.response_thread_exit.wait()
-
-        self.logger.info(f"Completed {self.processed_count} samples.")
 
     def _enqueue_impl(self, queries: List[LLMRequest]) -> List[int]:
         """
@@ -160,9 +154,9 @@ class TrtllmExecutorCore(LLMCore):
                            stop_words=query.stop_tokens)
             for query in queries
         ]
-
         # Submit to executor and get assigned IDs
         trtllm_request_ids = self.executor.enqueue_requests(enqueue_batch)
+
         return trtllm_request_ids
 
     def _poll_responses_impl(self, timeout: datetime.timedelta):
@@ -171,25 +165,20 @@ class TrtllmExecutorCore(LLMCore):
         The executor manages request scheduling and batching internally.
         This method retrieves any completed responses within the timeout.
         """
+        timeout = 0.0001 if timeout is None else timeout  # timeout=None will actually block
         ready_responses = self.executor.await_responses(timeout)
-        return [
+
+        responses = [
             LLMResponse(
                 request_id=response.request_id,
                 output_tokens=response.result.output_token_ids,
                 is_final_token=response.result.is_final,
-                error=None
+                error=None,
             )
             for response in ready_responses
         ]
 
-    def _cleanup_resources(self):
-        """Shutdown the executor and release GPU resources"""
-        self.executor.shutdown()
-        super()._cleanup_resources()
-
-    def run_health_check(self):
-        """Simple health check for TensorRT-LLM executor"""
-        assert self.executor.can_enqueue_requests(), "Executor not ready"
+        return responses
 
     def _update_progress_display(self, num_completed, num_toks, ttfts, tpots):
         """Update progress display with executor-specific metrics
@@ -212,21 +201,30 @@ class TrtllmExecutorCore(LLMCore):
 
         super()._update_progress_display(num_completed, num_toks, ttfts, tpots, additional_unit_updates)
 
+    def _cleanup_resources(self):
+        """Shutdown the executor and release GPU resources"""
+        self.executor.shutdown()
+        super()._cleanup_resources()
+
+    def run_health_check(self):
+        """Simple health check for TensorRT-LLM executor"""
+        assert self.executor.can_enqueue_requests(), "Executor not ready"
+
     @classmethod
     def get_num_cores_for_workload(cls, **kwargs) -> int:
         """Calculate cores based on GPU count and model parallelism"""
         harness_config = TrtllmHarnessConfig()
-        model_world_size = harness_config.tensor_parallelism * harness_config.pipeline_parallelism
+        model_world_size = harness_config.get_instance_size()
         devices = [gpu.gpu_index for gpu in DETECTED_SYSTEM.accelerators[GPU]]
         return len(devices) // model_world_size
 
     @classmethod
     def get_config_for_core(cls,
                             core_index: int,
-                            complete_callback: Callable,
                             progress_display: LLMServerProgressDisplay,
                             verbose: bool,
                             verbose_nvtx: bool,
+                            complete_callback: Callable,
                             engine_dir: str,
                             **kwargs) -> Dict[str, Any]:
         """Get configuration for a core instance """
@@ -242,9 +240,9 @@ class TrtllmExecutorCore(LLMCore):
         return {
             'name': f'TrtllmExecutorCore#{core_index}_devices-{device_ids}',
             'harness_config': config,
-            'complete_callback': complete_callback,
             'progress_display': progress_display,
             'verbose': verbose,
             'verbose_nvtx': verbose_nvtx,
+            'complete_callback': complete_callback,
             'device_ids': device_ids,
         }

@@ -2,9 +2,7 @@ import code.common.constants as C
 import code.llmlib.fields as llm_fields
 import code.fields.models as model_fields
 import code.fields.loadgen as loadgen_fields
-import code.fields.harness as harness_fields
-import os
-os.environ["FORCE_NCCL_ALL_REDUCE_STRATEGY"] = "1"  
+import code.fields.harness as harness_fields 
 
 EXPORTS = {
     C.WorkloadSetting(C.HarnessType.Custom, C.AccuracyTarget(0.99), C.PowerSetting.MaxP): {
@@ -17,8 +15,8 @@ EXPORTS = {
         model_fields.precision: 'fp4',
         loadgen_fields.server_target_qps: 1.3,
         harness_fields.tensor_path: 'build/preprocessed_data/llama3.1-405b/',
-        llm_fields.tensor_parallelism: 2,
-        llm_fields.pipeline_parallelism: 2,
+        llm_fields.tensor_parallelism: 4,
+        llm_fields.pipeline_parallelism: 1,
         llm_fields.trtllm_build_flags: {
             'max_beam_width': 1,
             'kv_cache_type': 'paged',
@@ -33,7 +31,7 @@ EXPORTS = {
             'tokens_per_block': 32,
             'use_fp8_context_fmha': 'enable',
             'norm_quant_fusion': 'enable',
-            'gemm_plugin': 'fp4',
+            'gemm_allreduce_plugin': 'float16',
         },
         llm_fields.trtllm_checkpoint_flags: {
             'kv_cache_dtype': 'fp8',

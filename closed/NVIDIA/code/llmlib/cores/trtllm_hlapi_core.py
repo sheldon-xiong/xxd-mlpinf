@@ -16,20 +16,18 @@
 import asyncio
 from copy import deepcopy
 import datetime
-import os
 from pathlib import Path
 from pprint import pformat
 import queue
-import tempfile
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Callable
 
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm.bench.benchmark.utils.general import get_settings
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
-from tensorrt_llm.llmapi import CapacitySchedulerPolicy, LLM
+from tensorrt_llm.llmapi import LLM, CapacitySchedulerPolicy
 
 from ..config import TrtllmHlApiConfig
 from ..utils import LLMServerProgressDisplay
@@ -52,20 +50,20 @@ class TrtllmHlApiCore(LLMCore):
         assert self.harness_config.gen_config.runtime_beam_width <= 1, "Beam > 1 not supported yet"
 
         # Initialize model paths
-        self.model_repo = self.harness_config.model_repo
+        self.model_repo = self.harness_config.get_model_repo()
         self.model_name, self.model_revision = list(self.model_repo.items())[0]
         self.model_path = Path(self.harness_config.model_path)
         assert Path(self.harness_config.model_path).exists(), f"{self.harness_config.model_path} does not exist"
 
-        # Write extra config to temporary file
-        self.extra_config_file = tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False)
-        self.extra_config_file.write(self.harness_config.extra_config_yaml)
-        self.extra_config_file.flush()
+        # Write extra config to log-dir
+        self.extra_config_path = Path(self.harness_config.log_dir) / "trtllm_hlapi_extra_conf.yaml"
+        with self.extra_config_path.open('w') as f:
+            f.write(self.harness_config.extra_config_yaml)
 
         # Prepare optimization parameters
         params = {
             "backend": self.harness_config.runtime_flags['trtllm_backend'],
-            "extra_llm_api_options": self.extra_config_file.name,
+            "extra_llm_api_options": str(self.extra_config_path),
             "beam_width": self.harness_config.gen_config.runtime_beam_width,
             "tp": self.harness_config.tensor_parallelism,
             "pp": self.harness_config.pipeline_parallelism,
@@ -78,17 +76,27 @@ class TrtllmHlApiCore(LLMCore):
             "kv_cache_reuse": False,
         }
 
-        # Get optimized settings using TensorRT-LLM utilities
+        # get trtllm LLMApi kwargs
         exec_settings = get_settings(params, None, self.model_name, self.model_path)
         exec_settings["model"] = str(self.model_path)
-        # exec_settings["settings_config"]["scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-        # NOTE(vir): cant disable this without crashing
         # exec_settings["settings_config"]["dynamic_max_batch_size"] = False
 
+        scheduler_policy = {
+            'MAX_UTILIZATION': CapacitySchedulerPolicy.MAX_UTILIZATION,
+            'GUARANTEED_NO_EVICT': CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+            'STATIC_BATCH': CapacitySchedulerPolicy.STATIC_BATCH,
+        }[self.harness_config.runtime_flags['batch_scheduler_policy']]
+        exec_settings['settings_config']['scheduler_policy'] = scheduler_policy
+
         kwargs = RuntimeConfig(**exec_settings).get_llm_args()
-        self.logger.debug(f"TensorRT-LLM initialization parameters:\n{pformat(kwargs, compact=False)}")
+        self.logger.info(f"TensorRT-LLM initialization parameters:\n{pformat(kwargs, compact=False)}")
 
         if self.harness_config.runtime_flags['trtllm_backend'] == 'pytorch':
+            # TODO(vir):
+            # cleanup some cpp backend flags
+            # RuntimeConfig ret-val now requires override?
+            kwargs.pop("extended_runtime_perf_knob_config")
+
             self.llm = LLM(**kwargs)
         else:
             # requires external engine build
@@ -113,27 +121,8 @@ class TrtllmHlApiCore(LLMCore):
         self._response_queue = queue.Queue()
         self._async_tasks = {}
 
-        # Initialize response thread
+        # start response completion thread after init
         self._initialize_response_thread()
-
-    def __del__(self):
-        """Cleanup Extra Config File"""
-        if hasattr(self, 'extra_config_file'):
-            try:
-                self.extra_config_file.close()
-                os.unlink(self.extra_config_file.name)
-            except:
-                pass
-
-        # Cleanup LLM instance
-        if self.llm is not None:
-            try:
-                self.llm.shutdown()
-            except:
-                pass
-
-        # Clear references
-        self.sampling_params = None
 
     def _enqueue_impl(self, queries: List[LLMRequest]) -> List[int]:
         """Enqueue queries using the high-level API's generate_async method
@@ -247,7 +236,7 @@ class TrtllmHlApiCore(LLMCore):
 
     def _poll_responses_impl(self, timeout: datetime.timedelta):
         """Poll responses from the response queue"""
-        end_time = time.time() + timeout.total_seconds()
+        end_time = time.time() + timeout.total_seconds() if timeout is not None else 0
         responses = []
 
         # Get all available responses without blocking
@@ -270,6 +259,16 @@ class TrtllmHlApiCore(LLMCore):
             pass
 
         return responses
+
+    def _cleanup_resources(self):
+        """Free GPU resources on core cleanup"""
+        if self.llm is not None:
+            try:
+                self.llm.shutdown()
+            except:
+                pass
+
+        super()._cleanup_resources()
 
     def run_health_check(self):
         """Health check for TRT-LLM high-level API"""
@@ -303,10 +302,10 @@ class TrtllmHlApiCore(LLMCore):
     @classmethod
     def get_config_for_core(cls,
                             core_index: int,
-                            complete_callback: callable,
                             progress_display: LLMServerProgressDisplay,
                             verbose: bool,
                             verbose_nvtx: bool,
+                            complete_callback: Callable,
                             model_path: str = None,
                             **kwargs) -> Dict[str, Any]:
         """Get configuration for a core instance """
@@ -316,8 +315,8 @@ class TrtllmHlApiCore(LLMCore):
         return {
             'name': f'TrtllmHlApiCore#{core_index}',
             'harness_config': config,
-            'complete_callback': complete_callback,
             'progress_display': progress_display,
             'verbose': verbose,
             'verbose_nvtx': verbose_nvtx,
+            'complete_callback': complete_callback,
         }

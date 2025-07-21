@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from code.llmlib import TrtllmServeClientHarnessOp, CoreType
+from code.llmlib import TrtllmServeClientHarnessOp, CoreType, TrtllmHLApiClientHarnessOp
 from code.llmlib.launch_server import RunTrtllmServeOp  # noqa: F401
 from code.llmlib.builder import LLMComponentEngine, HFQuantizerOp  # noqa: F401
 from .builder import DeepSeek_R1QuantizerConfig as QuantizerConfig  # noqa: F401
@@ -27,3 +27,4 @@ HF_MODEL_REPO = {"deepseek-ai/deepseek-r1": '56d4cbbb4d29f4355bab4b9a39ccb717a14
 
 ComponentEngine = LLMComponentEngine
 TrtllmServeBenchmarkHarnessOp = TrtllmServeClientHarnessOp
+TrtllmHLApiBenchmarkHarnessOp = TrtllmHLApiClientHarnessOp

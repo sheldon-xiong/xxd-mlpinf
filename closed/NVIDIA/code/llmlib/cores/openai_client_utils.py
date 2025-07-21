@@ -26,6 +26,7 @@ import queue
 import time
 import os
 from typing import List
+import uvloop
 
 import httpx
 from openai import AsyncOpenAI
@@ -85,11 +86,14 @@ class OpenAIConcurrentRequestManager:
                  config: TrtllmEndpointConfig,
                  max_concurrency: int,
                  workers_per_core: int,
-                 mode: HarnessWorkerMode):
+                 mode: HarnessWorkerMode,
+                 log_dir: str):
         self.config = config
         self.max_concurrency = max_concurrency
         self.workers_per_core = workers_per_core
         self.mode = mode
+        self.log_dir = log_dir
+        self.model_name, self.model_revision = list(self.config.get_model_repo().items())[0]
 
         self._response_queue = None  # Communication buffer between Core and LoadGen
         self._initialize()
@@ -119,17 +123,14 @@ class OpenAIConcurrentRequestManager:
         """
         self._response_queue = queue.Queue(maxsize=-1)
 
-        # Extract model information for tokenizer caching
-        model_name, model_revision = list(self.config.model_repo.items())[0]
-
         # Use the module-level event loop for consistent threading behavior
         self._loop = _get_module_loop()
-        self._request_provider = OpenAIConcurrentRequestProvider(self.config, self.max_concurrency)
+        self._request_provider = OpenAIConcurrentRequestProvider(self.config, self.max_concurrency, self.model_name, self.model_revision)
 
         # Initialize the provider in the event loop
         asyncio.run_coroutine_threadsafe(self._request_provider.initialize(), self._loop).result()
         # Override tokenizer with cached version for threading mode to prevent duplicate loading
-        self._request_provider.tokenizer = get_cached_tokenizer(model_name, model_revision)
+        self._request_provider.tokenizer = get_cached_tokenizer(self.model_name, self.model_revision)
 
     def _init_multiprocess(self):
         """
@@ -148,7 +149,15 @@ class OpenAIConcurrentRequestManager:
         self.current_worker_index = 0  # Round-robin counter for load balancing
 
         # Start worker processes using shared manager for consistent process lifecycle
-        init_args = [self.config, self.max_concurrency, self.request_queues, self._response_queue]
+        init_args = [
+            self.config,
+            self.max_concurrency,
+            self.request_queues,
+            self._response_queue,
+            self.model_name,
+            self.model_revision,
+            self.log_dir
+        ]
         self.worker_processes = WorkerProcessManager.start_worker_processes(
             worker_count=self.workers_per_core,
             worker_main_func=OpenAIConcurrentRequestManager._worker_process_main,
@@ -271,26 +280,21 @@ class OpenAIConcurrentRequestManager:
                 ).result()
 
     @classmethod
-    def _worker_process_main(cls, config: TrtllmEndpointConfig, max_concurrency: int, request_queues: List[mp.Queue], response_queue: mp.Queue, worker_id: int, readiness_queue: mp.Queue):
-        """
-        Main function for multiprocess worker (classmethod to avoid pickle issues).
-
-        This function runs in each worker process and sets up the environment:
-        - Configures logging to reduce noise from HTTP libraries
-        - Disables tokenizer parallelism (each process has one tokenizer)
-        - Creates a new event loop for this process
-        - Runs the worker loop until completion
-
-        Args:
-            config (TrtllmEndpointConfig): Configuration for the endpoint
-            max_concurrency (int): Maximum concurrent requests for this worker
-            request_queues (List[mp.Queue]): List of request queues (one per worker)
-            response_queue (mp.Queue): Shared response queue for all workers
-            worker_id (int): Unique identifier for this worker process
-            readiness_queue (mp.Queue): Queue for signaling worker readiness
-        """
+    def _worker_process_main(
+        cls,
+        config: TrtllmEndpointConfig,
+        max_concurrency: int,
+        request_queues: List[mp.Queue],
+        response_queue: mp.Queue,
+        model_name: str,
+        model_revision: str,
+        log_dir: str,
+        worker_id: int,
+        readiness_queue: mp.Queue,
+    ):
+        """ Main function for multiprocess worker. """
         # Set up logging for worker process - reduce HTTP library verbosity
-        setup_logging_for_worker(worker_id=worker_id)
+        setup_logging_for_worker(worker_id=worker_id, log_dir=log_dir)
 
         # Get this worker's dedicated request queue
         request_queue = request_queues[worker_id]
@@ -301,37 +305,44 @@ class OpenAIConcurrentRequestManager:
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
         # Create new event loop for this process (isolated from main process)
-        loop = asyncio.new_event_loop()
+        loop = uvloop.new_event_loop()
         asyncio.set_event_loop(loop)
 
         try:
             # Run the worker loop until completion or shutdown signal
-            loop.run_until_complete(cls._worker_loop(config, max_concurrency, request_queue, response_queue, readiness_queue))
+            loop.run_until_complete(cls._worker_loop(
+                config,
+                max_concurrency,
+                request_queue,
+                response_queue,
+                readiness_queue,
+                model_name,
+                model_revision
+            ))
         finally:
             # Always clean up the event loop
             loop.close()
 
     @classmethod
-    async def _worker_loop(cls, config: TrtllmEndpointConfig, max_concurrency: int, request_queue: mp.Queue, response_queue: mp.Queue, readiness_queue: mp.Queue):
-        """
-        Worker loop for multiprocess mode (classmethod to avoid pickle issues).
-
-        This is the main processing loop for each worker process:
-        1. Initialize the request provider with OpenAI client and tokenizer
-        2. Signal readiness to the main process
-        3. Process requests concurrently using asyncio tasks
-        4. Handle shutdown signals gracefully
-
-        Args:
-            config (TrtllmEndpointConfig): Configuration for the endpoint
-            max_concurrency (int): Maximum concurrent requests for this worker
-            request_queue (mp.Queue): This worker's request queue
-            response_queue (mp.Queue): Shared response queue for all workers
-            readiness_queue (mp.Queue): Queue for signaling initialization status
-        """
+    async def _worker_loop(
+        cls,
+        config: TrtllmEndpointConfig,
+        max_concurrency: int,
+        request_queue: mp.Queue,
+        response_queue: mp.Queue,
+        readiness_queue: mp.Queue,
+        model_name: str,
+        model_revision: str
+    ):
+        """ Worker loop for multiprocess mode. """
         try:
             # Initialize request provider for this worker process
-            request_provider = OpenAIConcurrentRequestProvider(config, max_concurrency)
+            request_provider = OpenAIConcurrentRequestProvider(
+                config,
+                max_concurrency,
+                model_name,
+                model_revision
+            )
             await request_provider.initialize()
 
             # Signal successful initialization to the main process
@@ -344,12 +355,13 @@ class OpenAIConcurrentRequestManager:
         # Process requests with concurrent handling using asyncio
         loop = asyncio.get_event_loop()
         active_tasks = set()  # Track active tasks for graceful shutdown
+        processed_queries = 0  # Track number of queries processed by this worker
 
         while True:
             try:
                 # Non-blocking get with short timeout to allow for shutdown checks
                 request_data = await loop.run_in_executor(None, request_queue.get, True, 0.1)
-
+                
                 if request_data is None:  # Shutdown signal from main process
                     break
 
@@ -359,6 +371,9 @@ class OpenAIConcurrentRequestManager:
                     input_tokens=request_data['input_tokens'],
                     stop_tokens=request_data['stop_tokens']
                 )
+
+                # Increment processed query counter
+                processed_queries += 1
 
                 # Create task for concurrent processing using the request provider
                 task = asyncio.create_task(
@@ -378,6 +393,9 @@ class OpenAIConcurrentRequestManager:
         if active_tasks:
             await asyncio.gather(*active_tasks, return_exceptions=True)
 
+        # Log total queries processed by this worker
+        logging.info(f"Worker process (PID: {os.getpid()}) processed {processed_queries} queries")
+
         # Clean up request provider and its resources
         await request_provider.shutdown()
 
@@ -391,10 +409,15 @@ class OpenAIConcurrentRequestProvider:
         max_concurrency (int): Maximum number of concurrent requests this provider can handle
     """
 
-    def __init__(self, config: TrtllmEndpointConfig, max_concurrency: int):
+    def __init__(self,
+                 config: TrtllmEndpointConfig,
+                 max_concurrency: int,
+                 model_name: str,
+                 model_revision: str):
         self.config = config
         self.max_concurrency = max_concurrency
-        self.model_name, self.model_revision = list(config.model_repo.items())[0]
+        self.model_name = model_name
+        self.model_revision = model_revision
         self.endpoint_url = config.endpoint_url
 
         # Initialize resources (will be set up in initialize() method)
@@ -484,7 +507,7 @@ class OpenAIConcurrentRequestProvider:
         """
         # Prepare generation parameters using standard OpenAI chat completions format
         gen_params = {
-            "model": list(self.config.model_repo.keys())[0],
+            "model": self.model_name,
             "max_tokens": self.config.gen_config.max_output_len,
             "temperature": self.config.gen_config.temperature,
             "top_p": self.config.gen_config.top_p,

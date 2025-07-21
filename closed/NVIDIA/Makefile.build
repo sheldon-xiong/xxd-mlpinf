@@ -33,8 +33,8 @@ INFERENCE_DIR = $(BUILD_DIR)/inference
 INFERENCE_URL = https://github.com/mlcommons/inference.git
 LOADGEN_INCLUDE_DIR ?= $(INFERENCE_DIR)/loadgen
 LOADGEN_LIB_DIR ?= $(LOADGEN_INCLUDE_DIR)/build
-# Loadgen hash: 7/8/2025
-INFERENCE_HASH = 24767db549fb6cf0cd506113e34a2a8402ea222f
+# Loadgen hash: 7/16/2025
+INFERENCE_HASH = 5232291860484b747ceeed7a327e56326e3eafe6
 
 # Set Environment variables to extracted contents
 export LD_LIBRARY_PATH := $(LD_LIBRARY_PATH):/usr/local/cuda/lib64:/usr/lib/$(ARCH)-linux-gnu:$(LOADGEN_LIB_DIR)
@@ -102,8 +102,8 @@ endif
 TRTLLM_DIR ?= $(BUILD_DIR)/TRTLLM
 TRTLLM_BUILD_DIR ?= $(BUILD_DIR)/TRTLLM/build
 TRTLLM_URL = https://github.com/NVIDIA/TensorRT-LLM.git
-# June 26 2025: support nvfp4 model and fp8 kv cache for MLA chunked prefill (Blackwell) (#5475)
-TRTLLM_HASH = 8836990bde20a4d3fc64a2aabe78b427e6899120
+# 7/16/25 1.0-mlpinf side branch (ADP schedule optimization)
+TRTLLM_HASH = cd2f9fa62f1c7d9fa35c23518092d45d022f226c
 
 
 BUILD_TRITON ?= 0
@@ -278,16 +278,7 @@ build_trt_llm:
 	cd $(TRTLLM_DIR) && CCACHE_NODISABLE=true /work/.llm_$(ARCH)/bin/python scripts/build_wheel.py --use_ccache --benchmarks -a="$(TRTLLM_BUILD_ARCH)" --no-venv --clean
 	/work/.llm_$(ARCH)/bin/pip install $(TRTLLM_BUILD_DIR)/tensorrt*.whl
 	/work/.llm_$(ARCH)/bin/pip install -r docker/common/requirements/requirements.llm.txt
-	@echo "Checking for Mixtral fp4-quantized model archive in /opt..."
-	@if [ -d "$(BUILD_DIR)/models/Mixtral/fp4-quantized-modelopt/mixtral-8x7b-instruct-v0.1-tp1pp1-fp4-e7.25-passing_acuracies" ]; then \
-		echo "Checkpoint directory already exists at $(BUILD_DIR)/models/Mixtral/fp4-quantized-modelopt/mixtral-8x7b-instruct-v0.1-tp1pp1-fp4-e7.25-passing_acuracies, skipping extraction."; \
-	elif [ -f "/opt/fp4-quantized-modelopt/mixtral-8x7b-instruct-v0.1-tp1pp1-fp4-e7.25.tar.gz" ]; then \
-		echo "Found model archive at /opt/fp4-quantized-modelopt/mixtral-8x7b-instruct-v0.1-tp1pp1-fp4-e7.25.tar.gz, extracting..."; \
-		mkdir -p $(BUILD_DIR)/models/Mixtral/fp4-quantized-modelopt/; \
-		tar -xzf /opt/fp4-quantized-modelopt/mixtral-8x7b-instruct-v0.1-tp1pp1-fp4-e7.25.tar.gz -C $(BUILD_DIR)/models/Mixtral/fp4-quantized-modelopt/; \
-	else \
-		echo "Model archive not found in /opt, skipping extraction."; \
-	fi
+
 
 # Build TensorRT plugins.
 .PHONY: build_plugins

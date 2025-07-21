@@ -59,7 +59,7 @@ from code.common.systems.system_list import DETECTED_SYSTEM
 from code.common.utils import prepare_virtual_env
 from code.common.workload import Workload
 from code.common.mlcommons.compliance import get_audit_verifier, set_audit_conf
-from code.llmlib.config import HarnessConfig
+from code.llmlib.config import HarnessConfig, TrtllmEndpointConfig, TrtllmHlApiConfig
 
 
 @autoconfigure
@@ -189,12 +189,14 @@ class MainRunner:
         power_context = get_power_context()
 
         with config.autoapply():
-            if benchmark.is_llm:
+            if benchmark.is_llm and benchmark is not C.Benchmark.WHISPER:  # Whisper is using PyHarnessOp in run harness
                 core_type = HarnessConfig().core_type
 
-                # TODO(vir): remove this
                 if self.action in (C.Action.GenerateTritonConfig,):
                     ops = self.get_triton_generate_config_op(benchmark)
+
+                if self.action in (C.Action.GenerateDisaggConfig,):
+                    ops = self.get_trtllm_disagg_generate_config_op(benchmark)
 
                 if self.action in (C.Action.GenerateEngines,):
                     ops = self.get_llm_generate_engine_ops(benchmark, core_type)
@@ -245,8 +247,13 @@ class MainRunner:
         match core_type:
             case harness_fields.CoreType.TRITON_GRPC: ops = get_build_ops(("CalibrateEngineOp", "EngineBuilderOp", "GenerateTritonConfigOp",))
             case harness_fields.CoreType.TRTLLM_EXECUTOR: ops = get_build_ops(("CalibrateEngineOp", "EngineBuilderOp", ))
-            case harness_fields.CoreType.TRTLLM_ENDPOINT: ops = get_build_ops(("HFQuantizerOp",))
-            case harness_fields.CoreType.TRTLLM_HLAPI: ops = get_build_ops(("HFQuantizerOp",))
+            case harness_fields.CoreType.TRTLLM_DISAGG: ops = get_build_ops(("HFQuantizerOp", ))
+            case harness_fields.CoreType.TRTLLM_ENDPOINT:
+                requires_engine = TrtllmEndpointConfig().runtime_flags['trtllm_backend'] == 'cpp'
+                ops = get_build_ops(("HFQuantizerOp",) if not requires_engine else ("CalibrateEngineOp", "EngineBuilderOp", ))
+            case harness_fields.CoreType.TRTLLM_HLAPI:
+                requires_engine = TrtllmHlApiConfig().runtime_flags['trtllm_backend'] == 'cpp'
+                ops = get_build_ops(("HFQuantizerOp",) if not requires_engine else ("CalibrateEngineOp", "EngineBuilderOp", ))
             case _: raise NotImplementedError(f"Unsupported core type: {core_type}")
         return ops
 
@@ -270,7 +277,8 @@ class MainRunner:
 
         match core_type:
             case harness_fields.CoreType.TRITON_GRPC: ops = get_launch_ops(("GenerateTritonConfigOp", "RunTritonServerOp"))
-            case harness_fields.CoreType.TRTLLM_ENDPOINT: ops = get_launch_ops(("RunTrtllmServeOp",))
+            case harness_fields.CoreType.TRTLLM_ENDPOINT: ops = self.get_llm_generate_engine_ops(benchmark, core_type) + get_launch_ops(("RunTrtllmServeOp",))
+            case harness_fields.CoreType.TRTLLM_DISAGG: ops = get_launch_ops(("RunTrtllmServeDisaggOp",))
             case harness_fields.CoreType.TRTLLM_EXECUTOR: ops = []  # no server
             case harness_fields.CoreType.TRTLLM_HLAPI: ops = []  # no server
             case _: raise NotImplementedError(f"Unsupported core type: {core_type}")
@@ -304,6 +312,7 @@ class MainRunner:
         match core_type:
             case harness_fields.CoreType.TRTLLM_EXECUTOR: ops = get_run_ops(("TrtllmExecutorBenchmarkHarnessOp",))
             case harness_fields.CoreType.TRTLLM_ENDPOINT: ops = get_run_ops(("TrtllmServeBenchmarkHarnessOp",))
+            case harness_fields.CoreType.TRTLLM_DISAGG: ops = get_run_ops(("TrtllmDisaggServeBenchmarkHarnessOp",))
             case harness_fields.CoreType.TRITON_GRPC: ops = get_run_ops(("TritonBenchmarkHarnessOp",))
             case harness_fields.CoreType.TRTLLM_HLAPI: ops = get_run_ops(("TrtllmHLApiBenchmarkHarnessOp",))
             case _: raise NotImplementedError(f"Unsupported core type: {core_type}")
@@ -367,6 +376,20 @@ class MainRunner:
         ops = []
 
         for k in ("CalibrateEngineOp", "EngineBuilderOp", "GenerateTritonConfigOp"):
+            if impls[k] is not None:
+                ops.append(impls[k])
+
+        return ops
+
+    def get_trtllm_disagg_generate_config_op(self, benchmark: C.Benchmark):
+        """Get the list of operations to generate Trtllm Disagg Server config files.
+        """
+        m = G_BENCHMARK_MODULES[benchmark]
+        m.load(("HFQuantizerOp", "GenerateTrtllmDisaggConfigOp",))
+        impls = m.custom_op_impls
+        ops = []
+
+        for k in ("HFQuantizerOp", "GenerateTrtllmDisaggConfigOp"):
             if impls[k] is not None:
                 ops.append(impls[k])
 

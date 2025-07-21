@@ -63,6 +63,7 @@ class LLAMA3_1_8BQuantizerConfig(QuantizerConfig):
 
         # To support testing multiple variants, we used the following naming schema to store each of them
         variant_dir = f"{model_name}-tp{self.tp_size}pp{self.pp_size}-{dtype_out.valstr}"
+        self.hf_output_path = output_path / ckpt_dir_map[dtype_out] / f"{model_name}-torch-{dtype_out.valstr}"
         output_path = output_path / ckpt_dir_map[dtype_out] / variant_dir
 
         super().__init__(*args,
